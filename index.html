@@ -14,6 +14,7 @@
   <script src="study-workspace.js" defer></script>
   <script src="api-client.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="onboarding.js" defer></script>
 </head>
 <body>
   <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -70,8 +71,7 @@
     </nav>
     <div class="sidebar-plan" id="sidebar-plan"></div>
     <div class="sidebar-bottom">
-      <button class="sidebar-link" data-action="api"><svg class="icon"><use href="#i-code"/></svg><span>API 调用</span></button>
-      <button class="sidebar-link" data-action="theme"><svg class="icon"><use href="#i-palette"/></svg><span>外观与偏好</span><span class="theme-dots"><i></i><i></i><i></i></span></button>
+      <button class="sidebar-link" data-action="theme"><svg class="icon"><use href="#i-settings"/></svg><span>设置</span><span class="theme-dots"><i></i><i></i><i></i></span></button>
       <button class="sidebar-link" data-action="help"><svg class="icon"><use href="#i-help"/></svg><span>使用指南</span><svg class="icon small-icon"><use href="#i-arrow"/></svg></button>
       <div class="local-note"><span class="status-dot"></span>专注学习，按需调用 API</div>
     </div>
@@ -82,7 +82,7 @@
       <div class="breadcrumb"><span class="mobile-brand">知序<span class="status-dot"></span></span><span class="breadcrumb-root">我的学习空间</span><span class="breadcrumb-divider">/</span><span id="page-crumb">学习工作台</span></div>
       <div class="topbar-actions">
         <form class="global-search" id="global-search" role="search"><svg class="icon"><use href="#i-search"/></svg><input name="query" aria-label="搜索题库或知识点" placeholder="搜索题库、知识点…" autocomplete="off"><kbd>/</kbd></form>
-        <button class="icon-button theme-top-button" data-action="theme" aria-label="自定义界面配色" title="自定义界面配色"><svg class="icon"><use href="#i-palette"/></svg></button>
+        <button class="button settings-top-button theme-top-button" data-action="theme" aria-label="打开设置" title="设置"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span>设置</span></button>
         <span class="topbar-separator"></span>
         <button class="profile-button" data-action="theme" aria-label="打开学习偏好"><span class="avatar">序</span><span class="profile-name">终身学习者<small>一点一滴，日有所进</small></span></button>
       </div>
@@ -100,6 +100,7 @@
     <a href="#stats" data-nav="stats"><svg class="icon"><use href="#i-chart"/></svg><span>统计</span></a>
   </nav>
 
+  <dialog id="snapshot-dialog" class="settings-dialog" aria-label="选择版本保存内容"></dialog>
   <dialog id="api-dialog" class="settings-dialog" aria-labelledby="api-title"></dialog>
   <dialog id="editor-dialog" class="settings-dialog" aria-labelledby="editor-title"></dialog>
   <input type="file" id="import-file" accept="application/json,.json" hidden>
@@ -109,12 +110,32 @@
   <dialog id="help-dialog" class="help-dialog" aria-labelledby="help-title">
     <div class="dialog-heading"><div><span class="eyebrow">A LITTLE GUIDE</span><h2 id="help-title">欢迎来到知序</h2></div><button class="icon-button" data-close="help-dialog" aria-label="关闭指南"><svg class="icon"><use href="#i-close"/></svg></button></div>
     <p class="help-intro">给自己留一点时间，让知识慢慢生长。</p>
-    <div class="guide-item"><span>01</span><div><h3>三种模式，独立保留进度</h3><p>背题直接显示答案，不计成绩；练习确认选择后在选项中标出答案；考试交卷后统一显示分数和逐题解析。各单元、错题和随机卷分别保存进度，默认继续，勾选「重新开始」才重置。</p></div></div>
+    <div class="guide-item"><span>01</span><div><h3>三种模式，独立保留进度</h3><p>背题直接显示答案，不计成绩；练习确认后判分；考试所有题型均选择后停留，点击下一题或选题切换，交卷后只显示错题与未作答题解析。收藏右侧的选题可展开题号自由跳转：考试仅标记已答蓝色、未答灰色；练习另标记答对绿色、答错红色；背题不标记状态颜色。练习和考试未答完提交时会提醒。继续按钮直接恢复进度，重新开始需确认并重新设置。</p></div></div>
     <div class="guide-item"><span>02</span><div><h3>错题按自己的规则复习</h3><p>答错自动收入错题本，可设置累计答对 1～100 次后移出，也能确认后手动移出。错题本支持独立随机组卷。原文有格式疑点的题暂不判分，编辑修正后再练。</p></div></div>
-    <div class="guide-item"><span>03</span><div><h3>组卷、计时与题库版本</h3><p>支持不计时、正计时、倒计时。随机卷可按单元、题型或两者叠加抽取，默认题型比例为60% / 30% / 10%，选项顺序不变。JSON 导入保留为同一本读本的独立版本，可随时切回默认版；各版本的进度与错题独立。</p></div></div>
+    <div class="guide-item"><span>03</span><div><h3>组卷、计时与题库版本</h3><p>支持不计时、正计时、倒计时。随机卷可按单元、题型或两者叠加抽取，默认题型比例为60% / 30% / 10%，选项顺序不变。JSON 导入保留为独立版本；题目和进度自动续存为本机草稿，在顶部设置中手动保存命名版本，可分别勾选题库内容、解析和学习进度。各版本进度独立；默认与自定义单元均可改名，单元和题目删除需两次确认，仅影响当前版本。删除会清理相关记录及包含已删题的练习进度。原始读本基准保留；保存版本时不勾选题库内容，可新建完整默认读本版本。</p></div></div>
     <div class="privacy-notice"><svg class="icon"><use href="#i-lock"/></svg><p>题目修改、解析和学习记录保存在当前浏览器，可用 JSON 导入导出。只有主动调用并确认后，才向你配置的 API 发送当前这一道题；不发送整本题库，分析不会自动修改答案。API 密钥不会进入备份。</p></div>
+    <button type="button" class="button soft full-width guide-help-replay" data-action="show-guide">重看箭头引导</button>
     <button class="button primary full-width" data-close="help-dialog">准备好了，开始学习<svg class="icon"><use href="#i-arrow"/></svg></button>
   </dialog>
+  <dialog id="first-visit-dialog" class="first-visit-dialog" aria-labelledby="first-visit-title" aria-describedby="first-visit-intro" closedby="none">
+    <div class="notice-content" tabindex="0" aria-label="使用须知正文">
+    <div class="notice-heading"><span class="eyebrow">BEFORE YOU BEGIN</span><h2 id="first-visit-title" tabindex="-1" autofocus>开始之前，请先阅读</h2><p id="first-visit-intro">欢迎来到知序。继续使用前，请了解以下使用边界，并尊重内容与作者的权益。请保持本页在前台阅读至少 5 秒，离开页面时暂停计时。</p></div>
+    <ol class="notice-list">
+      <li><strong>请勿未经允许转发或传播</strong><p>未经允许，禁止转发访问链接、分享安装包、复制题库或以其他形式二次传播。</p></li>
+      <li><strong>请勿擅自修改后再次发布</strong><p>未经允许，禁止修改本项目或内容后另行发布，包括镜像、改名或重新打包。</p></li>
+      <li><strong>禁止商业化使用</strong><p>禁止售卖、付费分发、收费代练、商业引流及其他商业化用途。</p></li>
+      <li><strong>应用内个人自定义练习不在禁止范围</strong><p>你可以在应用提供的功能内，为个人学习自定义练习、整理内容或修改题目；这些个人使用不属于上述禁止范围，但不授予转发、二次发布或商业化的许可。</p></li>
+      <li><strong>仅供学习，不用于诊疗</strong><p>题目、解析及 API 生成内容仅作学习参考，可能存在错误，不构成诊断、处方或治疗建议。</p></li>
+      <li><strong>数据在本地，API 费用由你承担</strong><p>学习记录主要保存在当前浏览器；清理数据、更换设备或使用隐私模式可能导致丢失，请及时备份。主动调用 API 会将当前题目发送给你配置的服务商，并可能产生费用，请自行确认隐私政策和计费规则。</p></li>
+    </ol>
+    </div>
+    <div class="notice-footer"><p id="notice-countdown" role="status" aria-live="polite">请保持本页在前台阅读，5 秒后可确认。</p><button type="button" id="accept-notice" class="button primary full-width" disabled>我已阅读并同意以上须知（5 秒）</button><p class="notice-local-note">仅在本地保存确认标识，不上传确认信息。若已自动恢复练习，引导将在你关闭练习后开始。</p></div>
+  </dialog>
+  <div id="onboarding-guide" class="onboarding-guide" popover="manual" role="dialog" aria-modal="true" aria-labelledby="guide-title" aria-describedby="guide-description">
+    <div id="guide-target-outline" class="guide-target-outline" aria-hidden="true"></div>
+    <svg class="guide-arrow" aria-hidden="true"><defs><marker id="guide-arrowhead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"/></marker></defs><path id="guide-arrow-path" marker-end="url(#guide-arrowhead)"/></svg>
+    <section class="guide-card" tabindex="-1"><div class="guide-heading"><span id="guide-step-count" class="eyebrow"></span><button type="button" class="text-button" id="guide-skip">跳过引导</button></div><h2 id="guide-title"></h2><p id="guide-description"></p><p id="guide-storage-note" class="setting-note" hidden></p><div class="guide-actions"><button type="button" id="guide-previous" class="button ghost">上一步</button><button type="button" id="guide-next" class="button primary">下一步</button></div></section>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <noscript><div class="noscript">知序需要启用 JavaScript 才能保存学习记录并开始练习。请在浏览器设置中启用 JavaScript。</div></noscript>
 </body>

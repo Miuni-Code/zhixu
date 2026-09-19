@@ -112,7 +112,7 @@
       }
       if (!clean(questionText)) throw new Error(`${context}第 ${number} 题缺少题干。`);
       return {
-        id: `${bank.id}-${type}-${number}`, type, sourceNumber: number,
+        id: `${bank.id}-${type}-${number}`, type, sourceNumber: number, position: bank.questions.length + index + 1,
         text: clean(questionText), raw, options, optionLabels, answer: [...new Set(answer)],
         referenceAnswer, flags, topic: `${LABELS[type]} · 原题 ${number}`,
         explanation: '原文仅提供参考答案，未提供逐题解析。判定依照读本参考答案；如有争议，以大赛知识读本及命题老师解释为准。'
@@ -180,9 +180,9 @@
 
   function allocate(total, weights, capacities) {
     if (!Number.isSafeInteger(total) || total < 1 || total > 10000) throw new Error('抽题数量须为 1～10000 的整数。');
-    if (!Array.isArray(weights) || weights.length !== 10 || weights.some(value => !Number.isFinite(value) || value < 0 || value > 100)) throw new Error('十个单元的比例须为 0～100 的有效数字。');
-    if (Math.abs(weights.reduce((sum, weight) => sum + weight, 0) - 100) > 0.000001) throw new Error('十个单元的比例合计必须为 100%。');
-    if (!Array.isArray(capacities) || capacities.length !== 10 || capacities.some(value => !Number.isSafeInteger(value) || value < 0)) throw new Error('可用题量无效。');
+    if (!Array.isArray(weights) || weights.length < 1 || weights.length > 100) throw new Error('组卷单元数量须为 1～100 个。');
+    validatePaperWeights(weights, weights.length, '各单元');
+    if (!Array.isArray(capacities) || capacities.length !== weights.length || Array.from(capacities).some(value => !Number.isSafeInteger(value) || value < 0)) throw new Error('可用题量无效。');
     const raw = weights.map(weight => total * weight / 100);
     const counts = raw.map(value => Math.floor(value));
     let remaining = total - counts.reduce((sum, value) => sum + value, 0);
@@ -191,19 +191,16 @@
       .filter(item => item.weight > 0).sort((a, b) => b.remainder - a.remainder || a.index - b.index);
     for (let index = 0; index < remaining; index++) counts[order[index].index]++;
     const shortage = counts.findIndex((count, index) => count > capacities[index]);
-    if (shortage !== -1) throw new Error(`第${NUMERALS[shortage]}单元需抽 ${counts[shortage]} 题，可用 ${capacities[shortage]} 题。请减少总题数或调整比例；不会重复抽题或擅自转移配额。`);
+    if (shortage !== -1) throw new Error(`第${NUMERALS[shortage] || shortage + 1}单元需抽 ${counts[shortage]} 题，可用 ${capacities[shortage]} 题。请减少总题数或调整比例；不会重复抽题或擅自转移配额。`);
     return counts;
   }
 
   function makePaper(banks, total, weights, includeFlagged = false, random = Math.random) {
-    const pools = banks.map(bank => bank.questions.filter(question => includeFlagged || !question.flags.length));
-    const counts = allocate(total, weights, pools.map(pool => pool.length));
-    const ids = shuffle(pools.flatMap((pool, index) => shuffle(pool, random).slice(0, counts[index]).map(question => question.id)), random);
-    if (ids.length !== total || new Set(ids).size !== total) throw new Error('组题校验失败：题量不符或题目编号重复。');
+    const { ids, counts } = makeConfiguredPaper(banks, { count: total, weights, includeFlagged }, random);
     return { ids, counts };
   }
 
-  // 新接口固定十个单元；题型顺序同时用于 typeWeights 和 typeCounts。
+  // 支持 1～100 个单元；题型顺序同时用于 typeWeights 和 typeCounts。
   const PAPER_TYPES = ['single', 'multiple', 'boolean'];
 
   function validatePaperWeights(weights, length, label) {
@@ -234,22 +231,23 @@
 
   function prepareConfiguredPaper(banks, config) {
     if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('组卷配置须为对象。');
-    const { count, allocationMode = 'unit', weights = Array(10).fill(10),
+    if (!Array.isArray(banks) || banks.length < 1 || banks.length > 100) throw new Error('组卷题库须包含 1～100 个单元。');
+    const unitCount = banks.length;
+    const { count, allocationMode = 'unit', weights = Array(unitCount).fill(100 / unitCount),
       typeWeights = [60, 30, 10], includeFlagged = false } = config;
     if (!Number.isSafeInteger(count) || count < 1 || count > 10000) throw new Error('抽题数量须为 1～10000 的整数。');
     if (!['unit', 'type', 'combined'].includes(allocationMode)) throw new Error('组卷模式须为 unit、type 或 combined。');
     if (typeof includeFlagged !== 'boolean') throw new Error('includeFlagged 须为布尔值。');
-    if (!Array.isArray(banks) || banks.length !== 10) throw new Error('组卷题库须包含按顺序排列的十个单元。');
     // 只校验当前模式生效的比例，另一维度既不参与配额也不限制抽题。
-    if (allocationMode !== 'type') validatePaperWeights(weights, 10, '十个单元');
+    if (allocationMode !== 'type') validatePaperWeights(weights, unitCount, '各单元');
     if (allocationMode !== 'unit') validatePaperWeights(typeWeights, 3, '三种题型');
-    const pools = Array.from({ length: 10 }, () => PAPER_TYPES.map(() => []));
+    const pools = Array.from({ length: unitCount }, () => PAPER_TYPES.map(() => []));
     const seen = new Set();
-    for (let unitIndex = 0; unitIndex < 10; unitIndex++) {
+    for (let unitIndex = 0; unitIndex < unitCount; unitIndex++) {
       const bank = banks[unitIndex];
-      if (!bank || !Array.isArray(bank.questions)) throw new Error(`第${NUMERALS[unitIndex]}单元的题目列表无效。`);
+      if (!bank || !Array.isArray(bank.questions)) throw new Error(`第${NUMERALS[unitIndex] || unitIndex + 1}单元的题目列表无效。`);
       for (const question of bank.questions) {
-        if (!question || typeof question !== 'object') throw new Error(`第${NUMERALS[unitIndex]}单元含无效题目。`);
+        if (!question || typeof question !== 'object') throw new Error(`第${NUMERALS[unitIndex] || unitIndex + 1}单元含无效题目。`);
         const typeIndex = PAPER_TYPES.indexOf(question.type);
         if (typeIndex === -1) continue;
         if (question.flags !== undefined && !Array.isArray(question.flags)) throw new Error('题目的疑点标记须为数组。');
@@ -269,9 +267,9 @@
   }
 
   function allocateCombined(pools, counts, typeCounts, random) {
-    // 源 -> 十单元 -> 三题型 -> 汇；所有容量均为整数，因此增广结果也为整数。
-    const source = 0, sink = 14;
-    const graph = Array.from({ length: 15 }, () => []);
+    // 源 -> 动态单元 -> 三题型 -> 汇；所有容量均为整数，因此增广结果也为整数。
+    const source = 0, typeStart = pools.length + 1, sink = typeStart + PAPER_TYPES.length;
+    const graph = Array.from({ length: sink + 1 }, () => []);
     function addEdge(from, to, capacity) {
       const forward = { to, capacity, reverse: null };
       const reverse = { to: from, capacity: 0, reverse: forward };
@@ -282,8 +280,8 @@
     }
     counts.forEach((count, unitIndex) => addEdge(source, unitIndex + 1, count));
     const cells = pools.map((row, unitIndex) => row.map((pool, typeIndex) =>
-      addEdge(unitIndex + 1, typeIndex + 11, pool.length)));
-    typeCounts.forEach((count, typeIndex) => addEdge(typeIndex + 11, sink, count));
+      addEdge(unitIndex + 1, typeIndex + typeStart, pool.length)));
+    typeCounts.forEach((count, typeIndex) => addEdge(typeIndex + typeStart, sink, count));
     // 只随机化边的遍历顺序，不修改容量或边际配额；预览不调用随机源。
     if (random) graph.forEach((edges, index) => { graph[index] = shuffle(edges, random); });
     const total = counts.reduce((sum, count) => sum + count, 0);
@@ -318,7 +316,7 @@
     return cells.map((row, unitIndex) => row.map((edge, typeIndex) => pools[unitIndex][typeIndex].length - edge.capacity));
   }
 
-  // config.count 必填；默认 unit / 十单元各 10% / 题型 60:30:10 / 排除疑点。
+  // config.count 必填；默认 unit / 按单元数均分（十单元各 10%）/ 题型 60:30:10 / 排除疑点。
   // 预览不抽题：未约束维度返回 null，combined 同时返回两组精确配额。
   function previewConfiguredPaper(banks, config) {
     const plan = prepareConfiguredPaper(banks, config);
@@ -347,7 +345,7 @@
       plan.pools.forEach((row, unitIndex) => row.forEach((pool, typeIndex) => draw(pool, cellCounts[unitIndex][typeIndex])));
     }
     const ids = shuffle(selected, nextRandom).map(item => item.id);
-    const counts = Array(10).fill(0), typeCounts = Array(3).fill(0);
+    const counts = Array(plan.pools.length).fill(0), typeCounts = Array(PAPER_TYPES.length).fill(0);
     selected.forEach(item => { counts[item.unitIndex]++; typeCounts[item.typeIndex]++; });
     if (ids.length !== plan.count || new Set(ids).size !== plan.count ||
         plan.counts?.some((count, index) => count !== counts[index]) ||

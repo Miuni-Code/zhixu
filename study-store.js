@@ -11,6 +11,9 @@
   });
   const TYPE_NAMES = Object.freeze({ single: '单选题', multiple: '多选题', boolean: '判断题' });
   const UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+  const CUSTOM_QUESTION = /^q-custom-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+  const CUSTOM_BANK = /^u-custom-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+  let sequence = 0;
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
   const same = (left, right) => left.length === right.length && left.every((value, index) => value === right[index]);
   const sameAnswer = (left, right) => same([...left].sort((a, b) => a - b), [...right].sort((a, b) => a - b));
@@ -124,10 +127,11 @@
     const options = strings(field(value, 'options'), '选项', LIMITS.options, LIMITS.option);
     const answer = array(field(value, 'answer'), '答案', LIMITS.options).map(index => integer(index, '答案下标', 0, options.length - 1));
     if (new Set(answer).size !== answer.length) invalid('答案下标不能重复。');
+    const id = identifier(field(value, 'id'), '题目 ID');
     return {
-      id: identifier(field(value, 'id'), '题目 ID'),
+      id,
       type: type(field(value, 'type')),
-      sourceNumber: integer(field(value, 'sourceNumber'), '原题号', 1, 500),
+      sourceNumber: integer(field(value, 'sourceNumber'), '原题号', 1, CUSTOM_QUESTION.test(id) ? LIMITS.questionsPerBank : 500),
       text: text(field(value, 'text'), '题干', LIMITS.text, true),
       options, answer,
       referenceAnswer: text(field(value, 'referenceAnswer'), '参考答案', LIMITS.referenceAnswer),
@@ -230,9 +234,9 @@
     return result;
   }
 
-  function finishQuestion(question, raw, labels, flags) {
+  function finishQuestion(question, raw, labels, flags, position = 1) {
     return {
-      id: question.id, type: question.type, sourceNumber: question.sourceNumber,
+      id: question.id, type: question.type, sourceNumber: question.sourceNumber, position,
       text: question.text, raw: text(raw, '原始题面', LIMITS.raw),
       options: [...question.options], optionLabels: [...labels], answer: [...question.answer],
       referenceAnswer: question.referenceAnswer, flags: [...flags],
@@ -289,8 +293,83 @@
     return result;
   }
 
-  /** 校验 JSON.parse 后的对象；baseline 必须始终是内置原始题库，而非上次导入的题库。
-   * 身份/数量/位置不符或编辑内容无效时抛 TypeError。返回全新白名单对象，可直接 JSON.stringify。
+  function customIdentifier(value, pattern, label) {
+    identifier(value, label);
+    if (!pattern.test(value)) invalid(`${label}必须使用安全的自定义 ID 前缀。`);
+    return value;
+  }
+
+  function newCustomId(prefix) {
+    const crypto = root.crypto;
+    const token = crypto && typeof crypto.randomUUID === 'function' ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${(++sequence).toString(36)}-${Math.random().toString(36).slice(2) || '0'}`;
+    return `${prefix}-${token}`;
+  }
+
+  function customQuestion(input) {
+    const question = readQuestion(input);
+    customIdentifier(question.id, CUSTOM_QUESTION, '自定义题目 ID');
+    const labels = labelsFor(question.type, question.options.length);
+    const suppliedLabels = field(input, 'optionLabels');
+    if (suppliedLabels !== undefined && !same(strings(suppliedLabels, '选项标签', LIMITS.options, 1), labels)) {
+      invalid('自定义题目选项标签必须与题型和选项顺序一致。');
+    }
+    const suppliedFlags = field(input, 'flags');
+    if (suppliedFlags !== undefined && strings(suppliedFlags, '疑点标记', 20, LIMITS.metadata).length) {
+      invalid('自定义题目不能携带原文异常 flags。');
+    }
+    if (inspect(question, labels).length) invalid('自定义题目必须具有完整选项和严格正常答案。');
+    const raw = field(input, 'raw');
+    const result = finishQuestion(question, raw === undefined ? '' : raw, labels, []);
+    const edited = field(input, 'edited');
+    if (edited !== undefined && typeof edited !== 'boolean') invalid('edited 必须为布尔值。');
+    if (edited !== undefined) result.edited = edited;
+    const editedAt = field(input, 'editedAt');
+    if (editedAt !== undefined) result.editedAt = timestamp(editedAt, '编辑时间');
+    const apiAnalysis = analysis(field(input, 'apiAnalysis'));
+    if (apiAnalysis !== undefined) result.apiAnalysis = apiAnalysis;
+    return result;
+  }
+
+  function customBank(id, title, unit) {
+    return {
+      id: customIdentifier(id, CUSTOM_BANK, '自定义单元 ID'), unit,
+      title: text(title, '自定义单元标题', LIMITS.title, true).trim(),
+      category: '自定义单元', label: `第${unit}单元`, subtitle: '',
+      icon: 'book', color: 'green', level: '自定义', tags: ['单选题', '多选题', '判断题'], questions: []
+    };
+  }
+
+  // 删除记录只接收 baseline 中的身份；缺省字段兼容旧备份，显式非法字段必须拒绝。
+  function deletionIds(value, key, allowed) {
+    if (!own(value, key)) return new Set();
+    const result = new Set();
+    for (const entry of array(field(value, key), key, allowed.size)) {
+      const id = identifier(entry, `${key} ID`);
+      if (!allowed.has(id)) invalid(`${key} 只能记录内置题库中的 ID。`);
+      if (result.has(id)) invalid(`${key} 不能包含重复 ID。`);
+      result.add(id);
+    }
+    return result;
+  }
+
+  // 内置编号不压缩；自定义单元从最大内置编号之后连续编号，与当前数组下标无关。
+  function numberCustomBanks(banks, baseline) {
+    let unit = Math.max(...array(field(baseline, 'banks'), '内置单元', LIMITS.banks).map(bank => field(bank, 'unit')));
+    for (const bank of banks) {
+      if (CUSTOM_BANK.test(bank.id)) {
+        bank.unit = ++unit;
+        bank.label = `第${unit}单元`;
+      }
+    }
+  }
+
+  /** baseline 必须始终是独立的原始内置十单元，不能带删除记录。
+   * deletedBankIds 记录整体删除的内置单元（包含其所有题）；deletedQuestionIds 记录删除的内置题。
+   * 两字段缺省视为空数组；自定义内容直接移除，不进入删除记录。
+   * 幸存内置单元/原题必须保留身份、归属、相对顺序及原题号；缺失必须有显式删除依据。
+   * 可插入 q-custom-* 题、末尾追加 u-custom-* 单元；返回全新白名单对象。
+   * position 按各单元数组位置重新生成，sourceNumber 不用于排序或身份判断。
    */
   function validateLibrary(raw, baseline) {
     object(raw, '导入题库');
@@ -299,33 +378,205 @@
     if (field(raw, 'id') !== id) invalid('只允许导入当前内置题库的备份。');
     const originals = array(field(baseline, 'banks'), '内置单元', LIMITS.banks);
     const incoming = array(field(raw, 'banks'), '导入单元', LIMITS.banks);
-    if (!originals.length || incoming.length !== originals.length) invalid('单元数量必须与内置题库一致。');
-    const bankIds = new Set(), units = new Set(), questionIds = new Set();
-    let total = 0, flagged = 0;
-    const banks = originals.map((original, bankIndex) => {
+    if (originals.length !== 10) invalid('baseline 必须完整保留内置十个单元。');
+    const originalBankIds = new Set(), units = new Set(), originalIds = new Set();
+    const originalBanks = originals.map(original => {
       const bank = bankMetadata(original);
-      if (bankIds.has(bank.id) || units.has(bank.unit)) invalid('内置题库单元重复。');
-      bankIds.add(bank.id);
+      if (bank.id.startsWith('u-custom-') || originalBankIds.has(bank.id) || units.has(bank.unit)) invalid('内置题库单元重复或使用自定义身份。');
+      originalBankIds.add(bank.id);
       units.add(bank.unit);
-      const input = object(incoming[bankIndex], '导入单元');
-      if (field(input, 'id') !== bank.id || field(input, 'unit') !== bank.unit) invalid('单元 ID、编号和顺序必须与内置题库一致。');
-      const originalQuestions = array(field(original, 'questions'), '内置题目', LIMITS.questionsPerBank);
-      const inputQuestions = array(field(input, 'questions'), '导入题目', LIMITS.questionsPerBank);
-      if (inputQuestions.length !== originalQuestions.length) invalid('每个单元的题量必须与内置题库一致，不能增删题目。');
-      bank.questions = originalQuestions.map((question, index) => {
-        const result = importedQuestion(inputQuestions[index], question);
-        if (questionIds.has(result.id)) invalid('内置题库题目 ID 重复。');
+      const questions = array(field(original, 'questions'), '内置题目', LIMITS.questionsPerBank);
+      for (const question of questions) {
+        object(question, '内置题目');
+        const questionId = identifier(field(question, 'id'), '内置题目 ID');
+        if (questionId.startsWith('q-custom-') || originalIds.has(questionId)) invalid('内置题库题目 ID 重复或使用自定义身份。');
+        originalIds.add(questionId);
+      }
+      return { bank, questions };
+    });
+    if (deletionIds(baseline, 'deletedBankIds', originalBankIds).size ||
+        deletionIds(baseline, 'deletedQuestionIds', originalIds).size) invalid('baseline 不能带删除记录。');
+    const deletedBanks = deletionIds(raw, 'deletedBankIds', originalBankIds);
+    const deletedQuestions = deletionIds(raw, 'deletedQuestionIds', originalIds);
+    const originalById = new Map(originalBanks.map(original => [original.bank.id, original]));
+    const survivingBanks = originalBanks.filter(original => !deletedBanks.has(original.bank.id));
+    const bankIds = new Set(), questionIds = new Set();
+    const customStart = Math.max(...units);
+    let total = 0, flagged = 0, originalBankIndex = 0, customCount = 0;
+    const banks = incoming.map(value => {
+      const input = object(value, '导入单元');
+      const bankId = identifier(field(input, 'id'), '单元 ID');
+      if (bankIds.has(bankId)) invalid('单元 ID 不能重复。');
+      if (deletedBanks.has(bankId)) invalid('已记录删除的内置单元不能仍然存在。');
+      bankIds.add(bankId);
+      const original = originalById.get(bankId);
+      let bank;
+      if (original) {
+        bank = original.bank;
+        if (survivingBanks[originalBankIndex]?.bank.id !== bankId || field(input, 'unit') !== bank.unit) {
+          invalid('幸存内置单元的 ID、编号和相对顺序必须与内置题库一致。');
+        }
+        originalBankIndex++;
+        const title = field(input, 'title');
+        // 未改名时保留 baseline 元数据的旧长度边界；用户新标题与自定义单元采用同一限制。
+        if (title !== bank.title) bank.title = text(title, '单元标题', LIMITS.title, true).trim();
+      } else {
+        if (originalBankIndex !== survivingBanks.length) invalid('自定义单元须排列在幸存内置单元后。');
+        // 最多 100 个当前单元；删光内置单元后允许 100 个自定义单元，编号可到 110。
+        const unit = integer(field(input, 'unit'), '自定义单元编号', 1, customStart + LIMITS.banks);
+        if (unit !== customStart + ++customCount) invalid('自定义单元须从内置最大编号之后连续编号。');
+        bank = customBank(bankId, field(input, 'title'), unit);
+      }
+      const survivingQuestions = original?.questions.filter(question => !deletedQuestions.has(field(question, 'id'))) ?? [];
+      let originalIndex = 0;
+      bank.questions = array(field(input, 'questions'), '导入题目', LIMITS.questionsPerBank).map((question, index) => {
+        object(question, '导入题目');
+        const questionId = identifier(field(question, 'id'), '题目 ID');
+        if (deletedQuestions.has(questionId)) invalid('已记录删除的内置题目不能仍然存在。');
+        let result;
+        if (originalIds.has(questionId)) {
+          const expected = survivingQuestions[originalIndex];
+          if (!expected || field(expected, 'id') !== questionId) invalid('幸存内置原题不能跨单元移动或改变相对顺序。');
+          result = importedQuestion(question, expected);
+          originalIndex++;
+        } else result = customQuestion(question);
+        if (questionIds.has(result.id)) invalid('题目 ID 不能重复。');
         questionIds.add(result.id);
+        result.position = index + 1;
         total++;
         if (result.flags.length) flagged++;
         return result;
       });
-      // 单、多选修正后同步更新由 Core 生成的题型数量摘要。
+      if (originalIndex !== survivingQuestions.length) invalid('缺失的内置原题必须明确记录删除。');
       bank.subtitle = ['single', 'multiple', 'boolean'].map(questionType => `${TYPE_NAMES[questionType]} ${bank.questions.filter(question => question.type === questionType).length}`).join(' · ');
       return bank;
     });
+    if (originalBankIndex !== survivingBanks.length) invalid('缺失的内置单元必须明确记录删除。');
     return { id, title: text(field(baseline, 'title'), '题库标题', LIMITS.title, true),
-      sourceText: text(field(baseline, 'sourceText'), '原始读本', LIMITS.sourceText), banks, total, flagged };
+      sourceText: text(field(baseline, 'sourceText'), '原始读本', LIMITS.sourceText), banks,
+      deletedBankIds: [...deletedBanks], deletedQuestionIds: [...deletedQuestions], total, flagged };
+  }
+
+  /** 为手动命名快照选择题库内容和解析；baseline 必须是独立的原始内置题库。
+   * content=true 保留删除记录、幸存内容和单元改名；false 恢复全部 baseline 内容并清空删除记录。
+   * 解析仅在稳定 ID 及题型、题干、选项、答案全部一致时复制；不按数组位置匹配。
+   * 未选择解析时恢复内置默认说明（含四项确认修订），自定义题解析置空。
+   * 学习进度不属于题库；由 Workspace.add 的可选 study 参数独立选择。
+   */
+  function snapshotLibrary(library, baseline, options) {
+    object(options, '快照选项');
+    const content = field(options, 'content'), includeAnalysis = field(options, 'analysis');
+    if (typeof content !== 'boolean' || typeof includeAnalysis !== 'boolean') {
+      invalid('快照 content、analysis 选项必须为布尔值。');
+    }
+    const original = validateLibrary(baseline, baseline);
+    const current = validateLibrary(library, original);
+    const originals = new Map(original.banks.flatMap(bank => bank.questions.map(question => [question.id, question])));
+    const sources = new Map(current.banks.flatMap(bank => bank.questions.map(question => [question.id, question])));
+    const result = content ? current : original;
+    for (const bank of result.banks) {
+      for (const question of bank.questions) {
+        const source = sources.get(question.id);
+        // 先记住独立校验后的值，避免 content=true 时清理同一对象导致丢失。
+        const explanation = source?.explanation, apiAnalysis = source?.apiAnalysis;
+        const matches = includeAnalysis && source && unchangedQuestion(question, source);
+        question.explanation = matches ? explanation : originals.get(question.id)?.explanation ?? '';
+        delete question.apiAnalysis;
+        if (matches && apiAnalysis !== undefined) question.apiAnalysis = apiAnalysis;
+      }
+    }
+    // 再次按白名单重建：返回值与原始库、当前库及 API 来源数组均不共享引用。
+    return validateLibrary(result, baseline);
+  }
+
+  /** 编辑表单传入 type/text/options/answer/explanation；answer 是零基下标数组。
+   * 未传 id 时只在创建时生成一次；后续编辑、插入、排序、导出均保留此 ID。
+   */
+  function createQuestion(changes, id = newCustomId('q-custom')) {
+    object(changes, '新题内容');
+    const questionType = type(field(changes, 'type'));
+    const options = field(changes, 'options');
+    const sourceNumber = field(changes, 'sourceNumber');
+    const explanation = field(changes, 'explanation');
+    const question = readQuestion({
+      id: customIdentifier(id, CUSTOM_QUESTION, '自定义题目 ID'), type: questionType,
+      sourceNumber: sourceNumber === undefined ? 1 : sourceNumber,
+      text: field(changes, 'text'), options: options === undefined && questionType === 'boolean' ? ['正确', '错误'] : options,
+      answer: field(changes, 'answer'), explanation: explanation === undefined ? '' : explanation, referenceAnswer: ''
+    });
+    question.answer.sort((left, right) => left - right);
+    const labels = labelsFor(question.type, question.options.length);
+    question.referenceAnswer = question.answer.map(index => labels[index]).join('');
+    return customQuestion({ ...question, optionLabels: labels, flags: [], raw: '' });
+  }
+
+  /** 返回新题库；调用方传当前题 ID 以插入其后，afterId=null（或 undefined）追加到末尾。 */
+  function addQuestion(library, bankId, question, afterId = null, baseline) {
+    const result = validateLibrary(library, baseline);
+    const bank = result.banks.find(item => item.id === identifier(bankId, '单元 ID'));
+    if (!bank) invalid('指定单元不存在。');
+    if (bank.questions.length >= LIMITS.questionsPerBank) invalid(`每个单元最多 ${LIMITS.questionsPerBank} 题。`);
+    const added = customQuestion(question);
+    let index = bank.questions.length;
+    if (afterId !== null) {
+      identifier(afterId, '插入位置题目 ID');
+      index = bank.questions.findIndex(item => item.id === afterId);
+      if (index === -1) invalid('插入位置题目不属于当前单元。');
+      index++;
+    }
+    bank.questions.splice(index, 0, added);
+    return validateLibrary(result, baseline);
+  }
+
+  /** 返回追加空白自定义单元的新题库；全库最多 100 个当前单元，已删除单元不占额度。 */
+  function addBank(library, title, baseline) {
+    const result = validateLibrary(library, baseline);
+    if (result.banks.length >= LIMITS.banks) invalid(`题库最多 ${LIMITS.banks} 个单元。`);
+    let id;
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const candidate = newCustomId('u-custom');
+      if (!result.banks.some(bank => bank.id === candidate)) { id = candidate; break; }
+    }
+    if (!id) invalid('无法生成未使用的自定义单元 ID，请重试。');
+    result.banks.push(customBank(id, title, 1));
+    numberCustomBanks(result.banks, baseline);
+    return validateLibrary(result, baseline);
+  }
+
+  /** 删除整个单元及其中所有题；内置单元记录删除，自定义单元直接移除，ID 均不重建。
+   * 单元删除记录包含其原题；此前逐题删除的记录仍保留，允许与单元删除记录同时存在。
+   */
+  function removeBank(library, bankId, baseline) {
+    const result = validateLibrary(library, baseline);
+    identifier(bankId, '单元 ID');
+    const index = result.banks.findIndex(bank => bank.id === bankId);
+    if (index === -1) invalid('指定单元不存在。');
+    const [bank] = result.banks.splice(index, 1);
+    if (!CUSTOM_BANK.test(bank.id)) result.deletedBankIds.push(bank.id);
+    numberCustomBanks(result.banks, baseline);
+    return validateLibrary(result, baseline);
+  }
+
+  /** 删除一题；内置原题记录删除，自定义题直接移除，允许单元为空。 */
+  function removeQuestion(library, questionId, baseline) {
+    const result = validateLibrary(library, baseline);
+    identifier(questionId, '题目 ID');
+    const bank = result.banks.find(item => item.questions.some(question => question.id === questionId));
+    if (!bank) invalid('指定题目不存在。');
+    const index = bank.questions.findIndex(question => question.id === questionId);
+    const [question] = bank.questions.splice(index, 1);
+    if (!CUSTOM_QUESTION.test(question.id)) result.deletedQuestionIds.push(question.id);
+    return validateLibrary(result, baseline);
+  }
+
+  /** 仅修改单元标题；清除首尾空白，最多 1000 字符，其余元数据仍按白名单校验。 */
+  function renameBank(library, bankId, title, baseline) {
+    const result = validateLibrary(library, baseline);
+    identifier(bankId, '单元 ID');
+    const bank = result.banks.find(item => item.id === bankId);
+    if (!bank) invalid('指定单元不存在。');
+    bank.title = text(title, '单元标题', LIMITS.title, true).trim();
+    return validateLibrary(result, baseline);
   }
 
   /** 部分字段更新；第三参数可注入毫秒时间或 ISO 字符串，使测试与重放可复现。
@@ -347,7 +598,9 @@
     next.referenceAnswer = next.answer.map(index => labels[index]).join('');
     const flags = inspect(next, labels);
     if (flags.length) invalid('编辑后的题目必须具有完整选项和严格正常答案。');
-    const result = finishQuestion(next, field(question, 'raw'), labels, []);
+    const position = field(question, 'position');
+    const result = finishQuestion(next, field(question, 'raw') ?? '', labels, [],
+      position === undefined ? 1 : integer(position, '题目位置', 1, LIMITS.questionsPerBank));
     result.edited = true;
     if (typeof now === 'number') {
       if (!Number.isFinite(now) || !Number.isFinite(new Date(now).getTime())) invalid('编辑时间无效。');
@@ -391,7 +644,8 @@
     return result;
   }
 
-  const api = Object.freeze({ validateLibrary, editedQuestion, recordMistake, isConfirmedBlankOption, LIMITS });
+  const api = Object.freeze({ validateLibrary, snapshotLibrary, createQuestion, addQuestion, addBank,
+    removeBank, removeQuestion, renameBank, editedQuestion, recordMistake, isConfirmedBlankOption, LIMITS });
   root.ZhixuStore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);

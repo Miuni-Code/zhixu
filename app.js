@@ -30,7 +30,15 @@
   const validColor = value => typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value);
   const todayKey = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
   const STUDY_MODES = { practice: '练习模式', memorize: '背题模式', exam: '考试模式' };
-  const defaultPreferences = () => ({ count: 100, weights: Array(10).fill(10), typeWeights: [60, 30, 10], allocationMode: 'combined', studyMode: 'practice', timerMode: 'stopwatch', minutes: 60, includeFlagged: false });
+  function defaultWeights(banks = BANKS) {
+    const originals = banks.filter(bank => !bank.id.startsWith('u-custom-'));
+    const preferred = originals.length ? originals : banks;
+    const weights = banks.map(bank => preferred.includes(bank) ? Math.floor(1000 / preferred.length) / 10 : 0);
+    if (preferred.length) weights[banks.indexOf(preferred.at(-1))] += Math.round((100 - weights.reduce((a, b) => a + b, 0)) * 10) / 10;
+    return weights;
+  }
+  const answeredItems = session => session.answers.filter(answer => answer && (session.mode === 'memorize' || answer.selection.length));
+  const defaultPreferences = () => ({ count: 100, weights: defaultWeights(), typeWeights: [60, 30, 10], allocationMode: 'combined', studyMode: 'practice', timerMode: 'stopwatch', minutes: 60, includeFlagged: false });
   const defaultState = (libraryId = library?.id ?? 'unloaded') => ({ version: 2, libraryId, attempts: [], favorites: [], mistakes: {}, mistakeTarget: 3, goal: 20, theme: { ...PRESETS[0].colors }, session: null, progress: {}, papers: [], preferences: defaultPreferences() });
   let storageFailed = false;
   let preserveUnreadStorage = false;
@@ -40,6 +48,10 @@
   let sortBy = 'recommended';
   let searchQuery = '';
   let listCategory = '全部';
+  let collectionSort = 'unit';
+  let paperRestartReady = false;
+  let addingQuestion = null;
+  const expandedUnits = new Set();
   let currentSelection = [];
   let activeStartedAt = 0;
   let questionElapsed = 0;
@@ -81,29 +93,64 @@
     return baseline;
   }
 
-  function persistLibrary(next) {
+  function persistLibrary(next, deleting = false) {
     if (preserveUnreadLibrary) throw new Error('原题库存储读取失败，已阻止覆盖。请先导出原存储副本，再导入已核验的 JSON 备份。');
     if (!repository) throw new Error('版本存储尚未恢复，暂不能保存修改。');
-    const previousKey = STORAGE_KEY;
-    // 默认版自动产生修改版时，也暂停旧版时钟，防止旧倒计时在新版本中继续流逝。
-    const originalTimer = state.session?.timer;
-    if (repository.activeId === 'default' && state.session) {
-      pauseTimer();
-      state.session.timer = Core.pauseClock(state.session.timer);
-      if (!saveState()) throw new Error('默认版本进度未能保存，已停止创建修改版。');
-    }
-    try { repository.update(next); }
-    catch (error) {
-      if (originalTimer && state.session) { state.session.timer = originalTimer; saveState(); }
-      throw new Error(`本次修改未保存：${error.message} 请先导出 JSON 备份。`);
-    }
+    if (preserveUnreadStorage || !saveState()) throw new Error('当前学习记录未能安全保存，请先导出恢复副本。');
+    const oldWeights = new Map(BANKS.map((bank, index) => [bank.id, state.preferences.weights[index]]));
+    const weights = next.banks.map(bank => oldWeights.get(bank.id) ?? 0);
+    let nextState;
+    if (deleting) {
+      const ids = new Set(next.banks.flatMap(bank => bank.questions.map(question => question.id)));
+      const bankIds = new Set(next.banks.map(bank => bank.id));
+      const compatible = session => session && session.ids.every(id => ids.has(id)) && (!session.key.startsWith('unit:') || bankIds.has(session.key.slice(5)));
+      const copied = JSON.parse(JSON.stringify(state));
+      copied.progress = Object.fromEntries(Object.entries(copied.progress).filter(([, session]) => compatible(session)));
+      if (!compatible(copied.session)) copied.session = null;
+      copied.preferences.weights = weights;
+      nextState = normalizeState(copied, next);
+      repository.saveDraft(next, nextState, studySnapshots.get(STORAGE_KEY) ?? null);
+      studySnapshots.set(STORAGE_KEY, JSON.stringify(nextState));
+    } else repository.saveDraft(next);
     setLibrary(next);
-    if (previousKey !== STORAGE_KEY) studySnapshots.set(STORAGE_KEY, localStorage.getItem(STORAGE_KEY));
-    if (originalTimer?.runningSince !== null && originalTimer && state.session) {
-      state.session.timer = Core.resumeClock(state.session.timer);
-      if (!state.session.answers[state.session.index]) activeStartedAt = Date.now();
-    }
+    if (nextState) {
+      state = nextState;
+      completedSession = null;
+      currentSelection = [...(state.session?.answers[state.session.index]?.selection ?? state.session?.draft ?? [])];
+      questionElapsed = state.session?.elapsed ?? 0; activeStartedAt = 0;
+      clearInterval(sessionInterval);
+      if (!state.session) $('#practice-dialog').close();
+    } else state.preferences.weights = weights;
+    if (Math.abs(state.preferences.weights.reduce((a, b) => a + b, 0) - 100) > .000001) state.preferences.weights = defaultWeights();
+    paperDraft.weights = [...state.preferences.weights];
     saveState();
+  }
+
+  function deleteContent(kind, id) {
+    const item = kind === 'bank' ? BANKS.find(bank => bank.id === id) : QUESTION_MAP.get(id);
+    if (!item) return;
+    const label = kind === 'bank' ? `单元“${item.title}”及其中 ${item.questions.length} 道题` : `题目“${item.text.slice(0, 70)}”`;
+    if (!window.confirm(`确定删除${label}吗？默认单元和原题也允许删除，仅影响当前版本。`)) return;
+    if (!window.confirm('请再次确认删除：相关作答、错题和收藏将移除，包含这些题目的练习进度将清除，未交卷考试不会结算。其他题目的成绩、其他入口与版本保留。建议先导出备份。')) return;
+    try {
+      parkSession();
+      const next = kind === 'bank' ? Store.removeBank(library, id, baseline) : Store.removeQuestion(library, id, baseline);
+      persistLibrary(next, true);
+      expandedUnits.delete(id);
+      $('#editor-dialog').close();
+      renderPage();
+      if (state.session) renderPractice();
+      showToast('已删除并保存到当前版本的工作草稿。保存版本或导出时勾选题库内容可保留删除结果。');
+    } catch (error) { showToast(error.message, 'help'); }
+  }
+
+  function renameBank(id) {
+    const bank = BANKS.find(item => item.id === id);
+    if (!bank) return;
+    const title = window.prompt('修改单元名称（默认与自定义单元均可修改）', bank.title);
+    if (title === null) return;
+    try { persistLibrary(Store.renameBank(library, id, title, baseline)); renderPage(); showToast('单元名称已保存。'); }
+    catch (error) { showToast(error.message, 'help'); }
   }
 
   function replaceQuestion(question, allowMemory = false) {
@@ -145,6 +192,7 @@
     }
     const map = new Map(flattenBanks(expectedLibrary?.banks ?? []).map(question => [question.id, question]));
     const clean = defaultState(expectedId);
+    clean.preferences.weights = defaultWeights(expectedLibrary?.banks ?? BANKS);
     const cleanAnswer = answer => ({ questionId: answer.questionId, selection: [...answer.selection],
       correct: [true, false, null].includes(answer.correct) ? answer.correct : isCorrect(map.get(answer.questionId), answer.selection), seconds: clamp(answer.seconds, 0, 86400) });
     const validAnswer = answer => {
@@ -172,9 +220,9 @@
     for (const key of Object.keys(clean.theme)) if (validColor(raw.theme?.[key])) clean.theme[key] = raw.theme[key];
     const preferences = raw.preferences;
     if (preferences && Number.isInteger(preferences.count) && preferences.count > 0 && preferences.count <= 10000 &&
-      Array.isArray(preferences.weights) && preferences.weights.length === 10 && preferences.weights.every(value => Number.isFinite(value) && value >= 0 && value <= 100) &&
-      Math.abs(preferences.weights.reduce((sum, value) => sum + value, 0) - 100) < .000001) {
-      clean.preferences = { ...defaultPreferences(), count: preferences.count, weights: [...preferences.weights], timerMode: ['countdown', 'none'].includes(preferences.timerMode) ? preferences.timerMode : 'stopwatch',
+      Array.isArray(preferences.weights) && preferences.weights.length <= expectedLibrary.banks.length && preferences.weights.every(value => Number.isFinite(value) && value >= 0 && value <= 100) &&
+      (expectedLibrary.banks.length === 0 || Math.abs(preferences.weights.reduce((sum, value) => sum + value, 0) - 100) < .000001)) {
+      clean.preferences = { ...defaultPreferences(), count: preferences.count, weights: expectedLibrary.banks.map((_, index) => preferences.weights[index] ?? 0), timerMode: ['countdown', 'none'].includes(preferences.timerMode) ? preferences.timerMode : 'stopwatch',
         studyMode: Object.hasOwn(STUDY_MODES, preferences.studyMode) ? preferences.studyMode : 'practice',
         allocationMode: ['unit', 'type', 'combined'].includes(preferences.allocationMode) ? preferences.allocationMode : 'unit',
         typeWeights: Array.isArray(preferences.typeWeights) && preferences.typeWeights.length === 3 && preferences.typeWeights.every(n => Number.isFinite(n) && n >= 0 && n <= 100) && Math.abs(preferences.typeWeights.reduce((a, b) => a + b, 0) - 100) < .000001 ? [...preferences.typeWeights] : [60, 30, 10],
@@ -189,20 +237,27 @@
       if (!session || !Array.isArray(session.ids) || !session.ids.length || session.ids.length > 10000 ||
         !session.ids.every(id => map.has(id)) || new Set(session.ids).size !== session.ids.length ||
         !Number.isInteger(session.index) || session.index < 0 || session.index >= session.ids.length ||
-        !Array.isArray(session.answers) || session.answers.length < session.index || session.answers.length > session.index + 1 ||
-        !session.answers.every((answer, index) => answer?.questionId === session.ids[index] && validAnswer(answer))) return null;
+        !Array.isArray(session.answers) || session.answers.length > session.ids.length ||
+        !Array.from(session.answers).every((answer, index) => answer == null || answer.questionId === session.ids[index] && validAnswer(answer))) return null;
       const timer = session.timer;
       const validTimer = timer && ['none', 'stopwatch', 'countdown'].includes(timer.mode) && Number.isFinite(timer.elapsedMs) && timer.elapsedMs >= 0 &&
         (timer.runningSince === null || (Number.isFinite(timer.runningSince) && timer.runningSince > 0 && timer.runningSince <= Date.now() + 60000)) &&
         (timer.mode !== 'countdown' || (Number.isFinite(timer.limitMs) && timer.limitMs >= 60000 && timer.limitMs <= 86400000));
-      const key = typeof session.key === 'string' && /^(unit:tcm-u\d{2}|question:tcm-u\d{2}-(?:single|multiple|boolean)-\d+|paper|mistakes|mistake-paper|favorites|daily|retry|legacy)$/.test(session.key) ? session.key : fallbackKey;
+      const allowedKey = value => typeof value === 'string' && (['paper', 'mistakes', 'mistake-paper', 'favorites', 'daily', 'retry', 'legacy'].includes(value) || value.startsWith('unit:') && expectedLibrary.banks.some(bank => bank.id === value.slice(5)) || value.startsWith('question:') && map.has(value.slice(9)));
+      const key = allowedKey(session.key) ? session.key : fallbackKey;
+      const drafts = {};
+      if (session.drafts && typeof session.drafts === 'object' && !Array.isArray(session.drafts)) {
+        for (const [index, selection] of Object.entries(session.drafts)) {
+          if (/^(0|[1-9]\d*)$/.test(index) && Number(index) < session.ids.length && validSelection(selection, map.get(session.ids[Number(index)]), true)) drafts[index] = [...selection];
+        }
+      }
       return {
         key, mode: Object.hasOwn(STUDY_MODES, session.mode) ? session.mode : 'practice',
         status: session.status === 'completed' ? 'completed' : 'active', reason: ['complete', 'timeout', 'finish'].includes(session.reason) ? session.reason : 'complete',
         title: typeof session.title === 'string' ? session.title.slice(0, 120) : '继续练习', ids: [...session.ids], index: session.index,
-        draft: validSelection(session.draft, map.get(session.ids[session.index]), true) ? [...session.draft] : [],
+        drafts, draft: validSelection(session.draft, map.get(session.ids[session.index]), true) ? [...session.draft] : [],
         elapsed: Number.isFinite(session.elapsed) ? clamp(session.elapsed, 0, 86400000) : 0,
-        answers: session.answers.map(cleanAnswer), timer: validTimer ? { mode: timer.mode, elapsedMs: timer.mode === 'none' ? 0 : Math.min(timer.elapsedMs, 31536000000),
+        answers: Array.from(session.answers, answer => answer == null ? null : { ...cleanAnswer(answer), ...(session.mode === 'exam' && session.status !== 'completed' ? { correct: null } : {}) }), timer: validTimer ? { mode: timer.mode, elapsedMs: timer.mode === 'none' ? 0 : Math.min(timer.elapsedMs, 31536000000),
           runningSince: timer.runningSince, limitMs: timer.mode === 'countdown' ? timer.limitMs : 0 } : { mode: 'stopwatch', elapsedMs: 0, runningSince: null, limitMs: 0 }
       };
     }
@@ -389,7 +444,7 @@
 
   function renderResume() {
     if (!state.session) return '';
-    return `<div class="resume-banner">${icon('clock')}<div><strong>上次的练习，等你继续</strong><p>${escapeHTML(state.session.title)} · 已完成 ${state.session.answers.length} / ${state.session.ids.length} 题</p></div><button class="button soft" data-action="resume">继续练习${icon('arrow')}</button></div>`;
+    return `<div class="resume-banner">${icon('clock')}<div><strong>上次的练习，等你继续</strong><p>${escapeHTML(state.session.title)} · 已完成 ${answeredItems(state.session).length} / ${state.session.ids.length} 题</p></div><button class="button soft" data-action="resume">继续练习${icon('arrow')}</button></div>`;
   }
 
   function renderDashboard() {
@@ -407,13 +462,13 @@
         <div class="week-card"><div class="card-heading"><h2>本周学习足迹</h2><span class="small-pill">本周</span></div><div class="week-summary"><strong>${weekCount}</strong><span>题</span><span class="week-hint">${weekCount ? '每一题都算数' : '从今天开始'}</span></div>${renderWeekChart()}<div class="week-footer">${icon('flame')}${stats.streak ? `已连续学习 ${stats.streak} 天，继续保持` : '第一步，就是最好的开始'}</div></div>
       </section>
       <section aria-label="学习概览">${renderStatCards()}</section>
-      <section aria-labelledby="banks-title"><div class="section-heading"><h2 id="banks-title">十单元练习<span class="section-subtitle">按读本编排，专注当前单元</span></h2><a class="text-button" href="#banks">全部单元${icon('arrow')}</a></div>${renderBankToolbar()}<div id="bank-results">${renderBankResults()}</div></section>
+      <section aria-labelledby="banks-title"><div class="section-heading"><h2 id="banks-title">单元练习<span class="section-subtitle">内置读本与个人自定义单元</span></h2><a class="text-button" href="#banks">全部单元${icon('arrow')}</a></div>${renderBankToolbar()}<div id="bank-results">${renderBankResults()}</div></section>
       <div class="inspiration">${icon('leaf')}学习不是一场竞赛，而是一段成为更好自己的旅程。</div>
     </div>`;
   }
 
   function renderBankToolbar() {
-    return `<div class="bank-toolbar"><span class="result-count">按原文十个单元编排 · 单元内可顺序或乱序练习</span><label class="bank-filter">${icon('filter')}<select id="bank-sort" aria-label="单元排序"><option value="recommended" ${sortBy === 'recommended' ? 'selected' : ''}>原文顺序</option><option value="progress" ${sortBy === 'progress' ? 'selected' : ''}>学习进度</option><option value="unstarted" ${sortBy === 'unstarted' ? 'selected' : ''}>未学优先</option></select></label></div>`;
+    return `<div class="bank-toolbar"><span class="result-count">内置单元保留原文顺序 · 自定义单元排列在后</span><label class="bank-filter">${icon('filter')}<select id="bank-sort" aria-label="单元排序"><option value="recommended" ${sortBy === 'recommended' ? 'selected' : ''}>原文顺序</option><option value="progress" ${sortBy === 'progress' ? 'selected' : ''}>学习进度</option><option value="unstarted" ${sortBy === 'unstarted' ? 'selected' : ''}>未学优先</option></select></label></div>`;
   }
 
   function filteredBanks() {
@@ -427,53 +482,61 @@
   function renderBankCard(bank) {
     const completed = getStats().unique;
     const count = bank.questions.filter(question => completed.has(question.id)).length;
-    const flagged = bank.questions.filter(question => question.flags.length).length;
-    return `<article class="bank-card unit-card"><div class="bank-card-top"><div class="bank-icon ${bank.color}"><span class="unit-number">${String(bank.unit).padStart(2, '0')}</span></div><span class="bank-label">${bank.label}</span></div>
-      <h3>${bank.title}</h3><p class="bank-card-description">${library ? bank.subtitle : '读本正文暂不可用'}</p><div class="bank-tags"><span>${library ? `${bank.questions.length} 道原文题` : '正文未就绪'}</span>${flagged ? `<span class="warning-text">${flagged} 道待核对</span>` : ''}</div>
-      <div class="bank-progress"><div class="bank-progress-label"><span>已练习 ${count} 题</span><strong>${percent(count, bank.questions.length)}%</strong></div><div class="progress-track"><span style="width:${percent(count, bank.questions.length)}%"></span></div></div>
-      <div class="unit-actions"><button class="button soft" data-unit="${bank.id}" data-order="sequence" ${library ? '' : 'disabled'}>${icon('book')}顺序刷题</button><button class="button" data-unit="${bank.id}" data-order="shuffle" ${library ? '' : 'disabled'}>${icon('shuffle')}乱序刷题</button></div></article>`;
+    const saved = state.progress[`unit:${bank.id}`];
+    return `<details class="unit-card" name="units" data-bank-details="${bank.id}" ${expandedUnits.has(bank.id) ? 'open' : ''}><summary class="unit-summary"><span class="unit-number">${String(bank.unit).padStart(2, '0')}</span><span class="unit-title">${escapeHTML(bank.title)}<small>${bank.questions.length} 题 · 已练 ${count} 题${saved ? ` · ${saved.status === 'completed' ? '已完成' : `进度 ${saved.index + 1}/${saved.ids.length}`}` : ''}</small></span>${icon('chevron')}</summary>
+      <div class="unit-detail"><p class="setting-note">${escapeHTML(bank.subtitle)}</p><div class="unit-actions"><button class="button primary" data-unit-continue="${bank.id}" ${bank.questions.length ? '' : 'disabled'}>${saved?.status === 'completed' ? '查看结果' : '继续刷题'}</button><button class="button" data-unit-restart="${bank.id}" ${bank.questions.length ? '' : 'disabled'}>重新开始</button><button class="button" data-add-bank-question="${bank.id}">新增题目</button><button class="button" data-rename-bank="${bank.id}">修改名称</button><button class="button warning-text" data-delete-bank="${bank.id}">删除单元</button></div></div></details>`;
   }
 
   function renderBankResults() {
     const banks = filteredBanks();
-    return `<p class="result-count" aria-live="polite">共 ${banks.length} 个单元 · ${banks.reduce((sum, bank) => sum + bank.questions.length, 0)} 道已载入题目</p><div class="bank-grid">${banks.length ? banks.map(renderBankCard).join('') : emptyState('search', '没有找到相关单元', '试试搜索「药膳」「中药」或题目中的关键词。', '清除搜索', 'clear-search')}</div>`;
+    return `<p class="result-count" aria-live="polite">共 ${banks.length} 个单元 · 点击标题展开</p><div class="compact-unit-grid">${banks.map(renderBankCard).join('')}<button class="add-unit-card" data-action="add-bank">＋ 增加单元</button></div>`;
   }
 
   function renderLibraryNotice() {
-    return `${renderVersionSelector()}<div class="source-banner">${icon('book')}<div><strong>${library ? `大赛知识读本 · 10 单元 · ${library.total} 题` : '大赛知识读本暂不可用'}</strong><p>${library ? `仅使用这一套题目；${library.flagged} 道格式疑问题暂不判分，可逐题编辑核对。` : '安装包缺少完整正文，当前无法开始练习。'}</p>${libraryError ? `<p class="warning-text">${escapeHTML(libraryError)}</p>` : ''}</div><div class="backup-actions"><button class="button" data-action="api">${icon('code')}API 调用</button><button class="button" data-action="export" ${library ? '' : 'disabled'}>导出 JSON</button><button class="button" data-action="import">导入 JSON</button></div></div>`;
+    return libraryError ? `<p class="source-warning" role="alert">${escapeHTML(libraryError)}</p>` : '';
   }
 
   function renderBanks() {
-    return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">TEN UNITS · ONE STEP AT A TIME</div><h1>按单元积累，扎实每一步。</h1><p class="heading-description">顺序练习保留原文题序，乱序练习只打乱题目，不改变选项顺序。</p></div><button class="button primary" data-action="random">${icon('shuffle')}随机组题</button></section>
-      ${renderLibraryNotice()}${renderResume()}<label class="search-field">${icon('search')}<input id="bank-search" aria-label="搜索单元或题目" value="${escapeHTML(searchQuery)}" placeholder="搜索单元名称或题目关键词…" autocomplete="off"><button class="icon-button" data-action="clear-search" aria-label="清除搜索">${icon('close', 'small-icon')}</button></label>
-      ${renderBankToolbar()}<div id="bank-results">${renderBankResults()}</div><div class="inspiration">${icon('lock')}仅供大赛学习复习，题目内容不替代专业诊疗建议。</div></div>`;
+    return `<div class="page-enter"><section class="page-heading"><div><h1>分单元练习</h1><p class="heading-description">点击单元展开。继续刷题直接恢复进度；重新开始可调整顺序、模式和计时。</p></div></section>
+      ${renderLibraryNotice()}<label class="search-field">${icon('search')}<input id="bank-search" aria-label="搜索单元或题目" value="${escapeHTML(searchQuery)}" placeholder="搜索单元名称或题目关键词…" autocomplete="off"><button class="icon-button" data-action="clear-search" aria-label="清除搜索">${icon('close', 'small-icon')}</button></label>
+      ${renderBankToolbar()}<div id="bank-results">${renderBankResults()}</div></div>`;
   }
 
   function renderPaperPage() {
-    if (!library) return `<div class="page-enter"><section class="page-heading"><h1>随机组题</h1></section>${renderLibraryNotice()}</div>`;
+    if (!library) return renderLibraryNotice();
     const draft = paperDraft;
-    return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">BUILD YOUR PRACTICE</div><h1>你的练习，自己来安排。</h1><p class="heading-description">从十个单元随机抽题，每组不重复；开始前即可查看各单元实际题数。</p></div><button class="button" data-action="reset-weights">${icon('reset')}恢复各 10%</button></section>${renderResume()}
-      <form id="paper-form">${progressControls('paper')}<label class="form-field">抽取方式<select id="allocation-mode">${[['unit', '仅按单元比例'], ['type', '仅按题型比例'], ['combined', '单元 + 题型叠加约束']].map(([value, label]) => `<option value="${value}" ${draft.allocationMode === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><div class="paper-layout"><section class="panel"><h2>单元抽题比例</h2><p class="panel-description">百分比占本次总题数的比例，合计须为 100%。允许设为 0%。</p><div class="allocation-list">${BANKS.map((bank, index) => `<div class="allocation-row"><span class="allocation-number">${String(bank.unit).padStart(2, '0')}</span><label for="weight-${index}">${bank.title}<small data-capacity="${index}"></small></label><div class="percent-input"><input id="weight-${index}" data-weight="${index}" type="number" min="0" max="100" step="0.1" value="${draft.weights[index]}" required aria-label="${bank.title}抽题百分比"><span>%</span></div><output data-quota="${index}" aria-label="${bank.title}分配题数">— 题</output></div>`).join('')}</div><div class="allocation-total"><span>比例合计</span><strong id="weight-total">100%</strong></div><p class="setting-note">题数按“最大余数法”分配：先取整数，再按小数余数从大到小补足，相同余数按单元顺序分配。实际题数以预览为准。</p></section>
-      <aside class="panel paper-options"><h2>题型比例与练习设置</h2><div id="type-weight-fields">${[['单选', 60], ['多选', 30], ['判断', 10]].map(([label, fallback], index) => `<label class="form-field">${label}占比（%）<input type="number" data-type-weight="${index}" min="0" max="100" step="0.1" required value="${draft.typeWeights?.[index] ?? fallback}"></label>`).join('')}</div><p class="setting-note">默认单选60%、多选30%、判断10%。叠加模式同时满足两组比例；不足时提示，不擅自转移配额。</p><label class="form-field">抽题总数<input type="number" id="paper-count" min="1" max="10000" step="1" value="${draft.count}" required><small>有效题量不足时会提示，不会重复抽题。</small></label>
-      ${timerFields(draft.timerMode, draft.minutes, 'paper', draft.studyMode)}<label class="checkbox-field"><input type="checkbox" id="paper-flagged" ${draft.includeFlagged ? 'checked' : ''}><span>包含原文疑问题<small>默认排除。勾选后可复习原文，疑问题不计入正确率。</small></span></label><div class="paper-preview" id="paper-preview" role="status" aria-live="polite"></div><button class="button primary full-width" id="paper-start" type="submit">生成并开始练习${icon('arrow')}</button><p class="setting-note">题目顺序随机混排，选项保留原文顺序。设置会在开始练习时保存。</p></aside></div></form></div>`;
+    return `<div class="page-enter"><section class="page-heading"><div><h1>随机组题</h1><p class="heading-description">按单元、题型或两者共同分配。题目随机，选项顺序不变。</p></div></section>
+      <form id="paper-form">${choiceFields('allocation-mode', '抽取方式', [['unit', '按单元'], ['type', '按题型'], ['combined', '单元＋题型']], draft.allocationMode)}
+      ${entryControls('paper', '继续进度', '重新抽取')}
+      <div class="paper-ratios"><section class="panel" id="unit-weight-panel"><div class="card-heading"><h2>单元抽取比例</h2><button type="button" class="text-button" data-action="reset-weights">恢复默认</button></div><p class="setting-note">合计 100%。新增单元默认 0%，可自行调整。</p><div class="allocation-list">${BANKS.map((bank, index) => `<div class="allocation-row"><label for="weight-${index}">${escapeHTML(bank.title)}<small data-capacity="${index}"></small></label><div class="percent-input"><input id="weight-${index}" data-weight="${index}" type="number" min="0" max="100" step="0.1" value="${draft.weights[index] ?? 0}" required aria-label="${escapeHTML(bank.title)}抽题百分比"><span>%</span></div><output data-quota="${index}">— 题</output></div>`).join('')}</div><div class="allocation-total"><span>比例合计</span><strong id="weight-total">100%</strong></div></section>
+      <section class="panel" id="type-weight-panel"><div class="card-heading"><h2>题型抽取比例</h2><button type="button" class="text-button" data-action="reset-type-weights">恢复默认</button></div><p class="setting-note">单选 60%、多选 30%、判断 10%，合计须为 100%。</p>${['单选', '多选', '判断'].map((label, index) => `<label class="form-field">${label}（%）<input data-type-weight="${index}" type="number" min="0" max="100" step="0.1" required value="${draft.typeWeights[index]}"></label>`).join('')}<p class="setting-note">叠加模式同时满足两组比例。库存不足时提示，不自动转移配额。</p></section></div>
+      <section class="panel" id="paper-practice-settings" tabindex="-1"><h2>练习设置</h2><label class="form-field">抽题总数<input type="number" id="paper-count" min="1" max="10000" step="1" value="${draft.count}" required></label>${timerFields(draft.timerMode, draft.minutes, 'paper', draft.studyMode)}<div class="paper-preview" id="paper-preview" role="status"></div><button class="button primary full-width" id="paper-start" type="submit">生成并开始练习${icon('arrow')}</button><p class="setting-note" id="paper-restart-note">${state.progress.paper && !paperRestartReady ? '已有进度。请点击继续进度，或先点击重新抽取确认后生成新卷。' : '设置只在生成成功后用于新练习；取消设置不会重置原进度。'}</p></section></form></div>`;
   }
 
+  function choiceFields(name, legend, choices, selected) {
+    return `<fieldset class="choice-group" id="${name}-choices"><legend>${legend}</legend>${choices.map(([value, label]) => `<label><input type="radio" name="${name}" value="${value}" ${value === selected ? 'checked' : ''}><span>${label}</span></label>`).join('')}</fieldset>`;
+  }
+
+  function choice(name) { return $(`[name="${name}"]:checked`)?.value; }
+
   function timerFields(mode, minutes, prefix, studyMode = state.preferences.studyMode) {
-    return `<label class="form-field">做题模式<select id="${prefix}-mode">${Object.entries(STUDY_MODES).map(([value, label]) => `<option value="${value}" ${studyMode === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><p class="setting-note">背题：直接看答案，不计成绩。练习：提交后显示答案。考试：交卷后统一显示分数、答案和解析；中途不显示或调用分析。</p><label class="form-field">计时方式<select id="${prefix}-timer"><option value="none" ${mode === 'none' ? 'selected' : ''}>不计时</option><option value="stopwatch" ${mode === 'stopwatch' ? 'selected' : ''}>正计时 · 记录用时</option><option value="countdown" ${mode === 'countdown' ? 'selected' : ''}>倒计时 · 限时练习</option></select></label><label class="form-field" id="${prefix}-minutes-field" ${mode === 'countdown' ? '' : 'hidden'}>限时（分钟）<input id="${prefix}-minutes" type="number" min="1" max="1440" step="1" value="${minutes}" ${mode === 'countdown' ? 'required' : 'disabled'}></label><p class="setting-note">关闭练习或切换题库会暂停并保存。限时练习运行时，切换标签或刷新不会重置时间，到时自动交卷。已有进度继续使用原设置；更改模式需选择重新开始。</p>`;
+    return `${choiceFields(`${prefix}-mode`, '做题模式', Object.entries(STUDY_MODES), studyMode)}<p class="setting-note">背题直接显示答案；练习确认后判分；考试选择后保留当前题，点击下一题或选题切换，交卷后只复盘错题和未作答题。</p>${choiceFields(`${prefix}-timer`, '计时方式', [['none', '不计时'], ['stopwatch', '正计时'], ['countdown', '倒计时']], mode)}<label class="form-field" id="${prefix}-minutes-field" ${mode === 'countdown' ? '' : 'hidden'}>限时（分钟）<input id="${prefix}-minutes" type="number" min="1" max="1440" step="1" value="${minutes}" ${mode === 'countdown' ? 'required' : 'disabled'}></label>`;
   }
 
   function updatePaperPreview() {
     if (!$('#paper-form')) return;
     paperDraft.count = Number($('#paper-count').value);
     paperDraft.weights = $$('[data-weight]').map(input => input.value === '' ? NaN : Number(input.value));
-    paperDraft.timerMode = $('#paper-timer').value;
-    paperDraft.studyMode = $('#paper-mode').value;
-    paperDraft.allocationMode = $('#allocation-mode').value;
+    paperDraft.timerMode = choice('paper-timer');
+    paperDraft.studyMode = choice('paper-mode');
+    paperDraft.allocationMode = choice('allocation-mode');
+    $('#unit-weight-panel').hidden = paperDraft.allocationMode === 'type';
+    $('#type-weight-panel').hidden = paperDraft.allocationMode === 'unit';
     paperDraft.typeWeights = $$('[data-type-weight]').map(input => input.value === '' ? NaN : Number(input.value));
     $$('[data-weight]').forEach(input => { input.disabled = paperDraft.allocationMode === 'type'; });
     $$('[data-type-weight]').forEach(input => { input.disabled = paperDraft.allocationMode === 'unit'; });
     paperDraft.minutes = Number($('#paper-minutes').value);
-    paperDraft.includeFlagged = $('#paper-flagged').checked;
+    paperDraft.includeFlagged = false;
     const countdown = paperDraft.timerMode === 'countdown';
     $('#paper-minutes-field').hidden = !countdown;
     $('#paper-minutes').disabled = !countdown;
@@ -489,7 +552,7 @@
       $$('[data-quota]').forEach((output, index) => { output.textContent = counts ? `${counts[index]} 题` : '随机'; });
       preview.textContent = `将抽取 ${paperDraft.count} 题。${typeCounts ? `单选 ${typeCounts[0]} / 多选 ${typeCounts[1]} / 判断 ${typeCounts[2]}。` : '题型不限制。'}${counts ? `覆盖 ${counts.filter(Boolean).length} 个单元。` : '跨单元随机。'}${countdown ? `限时 ${paperDraft.minutes} 分钟。` : paperDraft.timerMode === 'none' ? '不计时。' : '记录用时。'}`;
       preview.classList.remove('invalid');
-      $('#paper-start').disabled = false;
+      $('#paper-start').disabled = Boolean(state.progress.paper && !paperRestartReady);
     } catch (error) {
       $$('[data-quota]').forEach(output => { output.textContent = '— 题'; });
       preview.textContent = error.message;
@@ -498,18 +561,81 @@
     }
   }
 
-  function openUnitSetup(id, order) {
+  function openUnitSetup(id, restart = false) {
     if (!library) return openLibrary();
     pendingUnit = BANKS.find(bank => bank.id === id);
-    if (!pendingUnit) return;
+    if (!pendingUnit?.questions.length) return;
     const prefs = state.preferences;
-    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><div><span class="eyebrow">${pendingUnit.label}</span><h2 id="config-title">${pendingUnit.title}</h2></div><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭练习设置">${icon('close')}</button></div><form id="unit-form">${progressControls(`unit:${pendingUnit.id}`)}<fieldset class="mode-options"><legend>题目顺序</legend><label><input type="radio" name="unit-order" value="sequence" ${order !== 'shuffle' ? 'checked' : ''}>顺序刷题<small>从第一题开始，按原文顺序</small></label><label><input type="radio" name="unit-order" value="shuffle" ${order === 'shuffle' ? 'checked' : ''}>乱序刷题<small>本单元全部题目随机排列</small></label></fieldset>${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<p class="setting-note">共 ${pendingUnit.questions.length} 题，包含单选、多选和判断。原文格式疑问题会显示核对提醒，不自动判分。</p><button class="button primary full-width" style="margin-top:20px" type="submit">开始本单元练习${icon('arrow')}</button></form>${state.session ? '<button class="text-button" data-action="resume-from-config">或继续上次未完成的练习</button>' : ''}`;
-    $('#practice-config-dialog').showModal();
+    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(pendingUnit.title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭练习设置">${icon('close')}</button></div><form id="unit-form" data-restart="${restart}">${choiceFields('unit-order', '题目顺序', [['sequence', '顺序'], ['shuffle', '随机']], 'sequence')}${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<p class="setting-note">共 ${pendingUnit.questions.length} 题。取消设置保留原有进度。</p><button class="button primary full-width" type="submit">开始练习${icon('arrow')}</button></form>`;
+    if (!$('#practice-config-dialog').open) $('#practice-config-dialog').showModal();
+  }
+
+  function enterUnit(id, restart = false) {
+    const bank = BANKS.find(item => item.id === id);
+    if (!bank?.questions.length) return;
+    const key = `unit:${id}`;
+    if (restart) {
+      if (!confirmRestart()) return;
+      openUnitSetup(id, true);
+    } else if (!continueProgress(key)) {
+      startSession(bank.questions.map(question => question.id), `${bank.label} · ${bank.title}`, { ...state.preferences, key });
+    }
+  }
+
+  function confirmRestart() {
+    return window.confirm('确定重新开始吗？生成新练习后将替换此入口的进度，历史成绩和其他入口保留。取消设置不会清空原进度。');
   }
 
   function renderVersionSelector() {
-    if (!repository) return '';
-    return `<div class="version-selector"><label class="form-field">当前题库版本<select id="library-version">${repository.list().map(item => `<option value="${escapeHTML(item.id)}" ${item.id === repository.activeId ? 'selected' : ''}>${escapeHTML(item.name)}</option>`).join('')}</select></label><button class="button" data-action="delete-version" ${repository.activeId === 'default' ? 'disabled' : ''}>删除此版本</button><p class="setting-note">默认版始终保留（含已确认的四题修订）。导入/编辑为独立版本，各自保存练习进度、错题和收藏。</p></div>`;
+    if (!repository) return `<section class="setting-section"><h3>题库存储恢复</h3><p class="warning-text">${escapeHTML(libraryError || '版本存储尚未恢复，请先保留恢复副本。')}</p><button class="button" data-action="export">导出恢复副本</button></section>`;
+    return `<section class="setting-section" id="version-settings"><h3>当前题库版本</h3><label class="form-field">选择版本<select id="library-version">${repository.list().map(item => `<option value="${escapeHTML(item.id)}" ${item.id === repository.activeId ? 'selected' : ''}>${escapeHTML(item.name)}</option>`).join('')}</select></label><div class="backup-actions"><button class="button primary" data-action="save-version">保存版本</button><button class="button" data-action="rename-version" ${repository.activeId === 'default' ? 'disabled' : ''}>修改名称</button><button class="button" data-action="delete-version" ${repository.activeId === 'default' ? 'disabled' : ''}>删除版本</button><button class="button" data-action="export">导出 JSON</button><button class="button" data-action="import">导入 JSON</button></div><p class="setting-note">题目修改与进度自动续存为本机工作草稿，不会自动创建命名版本。保存版本时按勾选项创建快照；未勾选的进度、用户解析和自定义内容不写入快照。原始读本基准及四题修订保留，当前版本中的默认单元和题目也可删改。导出也按勾选内容生成，不包含接口配置或密钥。</p></section>`;
+  }
+
+  function openSnapshot(exporting = false) {
+    if (preserveUnreadLibrary || preserveUnreadStorage) return exporting ? exportBackup() : showToast('存储已保护，请先导出恢复副本。', 'help');
+    pauseForDialog();
+    $('#snapshot-dialog').innerHTML = `<div class="dialog-heading"><h2>${exporting ? '导出 JSON' : '保存版本'}</h2><button class="icon-button" data-close="snapshot-dialog" aria-label="关闭">${icon('close')}</button></div><form id="snapshot-form" data-export="${exporting}">${exporting ? '' : '<label class="form-field">版本名称<input name="name" required maxlength="80" placeholder="例如：第一轮复习"></label>'}<fieldset class="snapshot-options"><legend>选择保存内容（默认均不选）</legend><label class="checkbox-field"><input type="checkbox" name="content">题库内容：单元改名、题面和答案修改、新增及删除的单元和题目</label><label class="checkbox-field"><input type="checkbox" name="analysis">解析：手写解析和 API 分析</label><label class="checkbox-field"><input type="checkbox" name="progress">学习进度：作答、错题、收藏、组卷与续做记录</label></fieldset><p class="setting-note">未选题库内容时使用默认读本。解析与进度只保留题面及答案仍一致的题目；不兼容的整组进度不复制。原草稿不受影响。</p><p id="snapshot-error" class="warning-text" role="alert"></p><button class="button primary" type="submit">${exporting ? '生成文件' : '保存为新版本'}</button></form>`;
+    $('#snapshot-dialog').showModal();
+  }
+
+  function snapshotStudy(nextLibrary, include) {
+    const fresh = defaultState(nextLibrary.id);
+    fresh.preferences.weights = defaultWeights(nextLibrary.banks);
+    if (!include) return fresh;
+    const compatible = new Set(nextLibrary.banks.flatMap(bank => bank.questions).filter(question => {
+      const source = QUESTION_MAP.get(question.id);
+      return source && JSON.stringify([source.type, source.text, source.options, source.answer]) === JSON.stringify([question.type, question.text, question.options, question.answer]);
+    }).map(question => question.id));
+    const copied = JSON.parse(JSON.stringify(state));
+    copied.attempts = copied.attempts.filter(answer => compatible.has(answer.questionId));
+    copied.favorites = copied.favorites.filter(id => compatible.has(id));
+    copied.mistakes = Object.fromEntries(Object.entries(copied.mistakes).filter(([id]) => compatible.has(id)));
+    copied.progress = Object.fromEntries(Object.entries(copied.progress).filter(([, session]) => session.ids.every(id => compatible.has(id))));
+    if (copied.session && !copied.session.ids.every(id => compatible.has(id))) copied.session = null;
+    if (compatible.size < QUESTIONS.length) copied.papers = [];
+    copied.preferences.weights = nextLibrary.banks.map(bank => copied.preferences.weights[BANKS.findIndex(source => source.id === bank.id)] ?? 0);
+    const sum = copied.preferences.weights.reduce((a, b) => a + b, 0);
+    if (Math.abs(sum - 100) > .000001) copied.preferences.weights = defaultWeights(nextLibrary.banks);
+    return normalizeState(copied, nextLibrary);
+  }
+
+  function saveSnapshot(form) {
+    try {
+      parkSession();
+      if (!saveState()) throw new Error('本机记录未能安全保存，请先导出恢复副本。');
+      const content = form.elements.content.checked, analysis = form.elements.analysis.checked;
+      const next = Store.snapshotLibrary(library, baseline, { content, analysis });
+      const study = snapshotStudy(next, form.elements.progress.checked);
+      if (form.dataset.export === 'true') {
+        downloadFile(JSON.stringify({ format: 'zhixu-library', version: 3, library: next, study, exportedAt: new Date().toISOString() }, null, 2), `知序-所选内容-${todayKey()}.json`, 'application/json;charset=utf-8');
+        showToast('已按所选内容导出 JSON，不含 API 配置。');
+      } else {
+        repository.add(form.elements.name.value.trim(), next, study);
+        adoptVersion();
+        showToast('命名版本已保存，未勾选内容没有写入新版本。原工作草稿保留。');
+      }
+      $('#snapshot-dialog').close();
+    } catch (error) { $('#snapshot-error').textContent = error.message; }
   }
 
   function switchVersion(id) {
@@ -534,6 +660,7 @@
     preserveUnreadStorage = false; storageFailed = false;
     state = loadState();
     if (state.session) state.session.timer = Core.pauseClock(state.session.timer);
+    paperRestartReady = false;
     paperDraft = { ...state.preferences, weights: [...state.preferences.weights], typeWeights: [...state.preferences.typeWeights] };
     currentSelection = []; completedSession = null; questionElapsed = 0; activeStartedAt = 0;
     clearInterval(sessionInterval);
@@ -761,7 +888,19 @@
     } finally { if (apiJobs.get(id) === controller) { apiJobs.delete(id); apiStreams.delete(id); } refreshAPIPanel(id); }
   }
 
+  function openNewQuestion(bankId, afterId = null) {
+    if (state.session?.mode === 'exam') return showToast('考试中不能新增题目。', 'help');
+    const bank = BANKS.find(item => item.id === bankId);
+    if (!bank) return;
+    pauseForDialog();
+    addingQuestion = { bankId, afterId };
+    editingId = null;
+    $('#editor-dialog').innerHTML = `<div class="dialog-heading"><h2 id="editor-title">新增题目</h2><button class="icon-button" data-close="editor-dialog" aria-label="关闭">${icon('close')}</button></div><p class="setting-note">${escapeHTML(bank.title)} · ${afterId ? '插入当前题后' : '追加到单元末尾'}。题目按位置自动编号，原题身份不变。当前练习题序不变，重新开始时纳入新题。</p><form id="editor-form"><label class="form-field">题型<select id="edit-type"><option value="single">单选题</option><option value="multiple">多选题</option><option value="boolean">判断题</option></select></label><label class="form-field">题干<textarea id="edit-text" rows="3" required maxlength="20000"></textarea></label><div id="edit-options">${[0, 1, 2, 3].map(i => editorOption(i, '', false, 'single')).join('')}</div><button class="button" type="button" data-action="add-option">增加选项</button><p class="setting-note">勾选正确答案。单选/判断恰好一项，多选至少两项。</p><label class="form-field">解析<textarea id="edit-explanation" rows="3" maxlength="200000"></textarea></label><p id="editor-error" role="alert" class="warning-text"></p><button class="button primary" type="submit">新增题目</button></form>`;
+    if (!$('#editor-dialog').open) $('#editor-dialog').showModal();
+  }
+
   function openEditor(id) {
+    addingQuestion = null;
     const question = QUESTION_MAP.get(id);
     if (!question || state.session?.mode === 'exam') return;
     cancelAPI(id);
@@ -775,7 +914,7 @@
       ${question.type !== 'boolean' ? '<button class="button" type="button" data-action="add-option">增加选项</button>' : ''}
       <p class="setting-note">勾选正确答案：单选 / 判断恰好 1 项，多选至少 2 项。删除选项后请重新确认答案。判断选项固定为正确、错误。</p>
       <label class="form-field">解析<textarea id="edit-explanation" rows="5" maxlength="200000">${escapeHTML(question.explanation)}</textarea></label>
-      <p class="setting-note">修改题干、选项或答案会清除过期 API 分析；历史成绩不重算，正在进行的练习会结束并保留已提交记录。</p><p id="editor-error" class="warning-text" role="alert"></p><button type="submit" class="button primary full-width">保存题目</button></form>`;
+      <p class="setting-note">修改题干、选项或答案会清除过期 API 分析；历史成绩不重算，正在进行的练习会结束并保留已提交记录。</p><p id="editor-error" class="warning-text" role="alert"></p><button type="submit" class="button primary full-width">保存题目</button><button type="button" class="button warning-text full-width" data-delete-question="${question.id}">删除这道题</button></form>`;
     $('#editor-dialog').showModal();
   }
 
@@ -785,6 +924,16 @@
 
   function saveEditor() {
     try {
+      if (addingQuestion) {
+        const question = Store.createQuestion({ type: $('#edit-type').value, text: $('#edit-text').value.trim(), options: $$('[data-edit-option]').map(input => input.value.trim()), answer: $$('[data-edit-correct]').flatMap((input, index) => input.checked ? [index] : []), explanation: $('#edit-explanation').value });
+        const { bankId, afterId } = addingQuestion;
+        persistLibrary(Store.addQuestion(library, bankId, question, afterId, baseline));
+        addingQuestion = null;
+        $('#editor-dialog').close(); renderPage();
+        if (state.session) renderPractice();
+        showToast('新题已插入并自动编号。保存命名版本时请勾选题库内容。');
+        return;
+      }
       const previous = QUESTION_MAP.get(editingId);
       const next = Store.editedQuestion(previous, { type: $('#edit-type').value, text: $('#edit-text').value.trim(),
         options: $$('[data-edit-option]').map(input => input.value.trim()),
@@ -815,35 +964,53 @@
 
   function questionType(question) { return Core.LABELS[question.type]; }
 
+  function collectionIds(type) {
+    const ids = (type === 'mistakes' ? getStats().mistakes : state.favorites).filter(id => QUESTION_MAP.has(id));
+    if (collectionSort === 'unit') {
+      const positions = new Map(QUESTIONS.map((question, index) => [question.id, index]));
+      ids.sort((a, b) => positions.get(a) - positions.get(b));
+    }
+    return ids;
+  }
+
   function renderCollection(type) {
     const mistakes = type === 'mistakes';
-    const ids = mistakes ? getStats().mistakes : state.favorites;
+    const ids = collectionIds(type);
     const availableCategories = ['全部', ...new Set(ids.map(id => QUESTION_MAP.get(id).category))];
     if (!availableCategories.includes(listCategory)) listCategory = '全部';
     const questions = ids.map(id => QUESTION_MAP.get(id)).filter(question => listCategory === '全部' || question.category === listCategory);
     const title = mistakes ? '把每一次错误，变成进步。' : '值得记住的，留在这里。';
     const description = mistakes ? `答错自动收录，进入错题本后累计答对 ${state.mistakeTarget} 次自动移出；再次答错不清零。手动移出只影响错题本。` : '收藏那些有启发的题目，建立属于自己的知识清单。';
-    return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">${mistakes ? 'REVIEW & GROW' : 'YOUR KNOWLEDGE COLLECTION'}</div><h1>${title}</h1><p class="heading-description">${description}</p></div>${ids.length ? `<button class="button primary" data-action="review-${type}">${icon(mistakes ? 'notebook' : 'star')}${mistakes ? '复习错题' : '练习收藏'}</button>` : ''}</section>
-${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] ? `<div class="progress-controls"><button class="button primary" data-continue="${mistakes ? 'mistakes' : 'favorites'}">继续已保存的${mistakes ? '错题' : '收藏'}练习 / 查看结果</button></div>` : ''}
-      ${mistakes ? `<section class="panel mistake-settings"><form id="mistake-rule-form"><label class="form-field">累计答对几次后移出<input name="target" type="number" min="1" max="100" step="1" required value="${state.mistakeTarget}"></label><button class="button" type="submit">保存规则</button></form><p class="setting-note">可设 1～100 次。修改规则不立即清空错题，下次答对时按新规则判断。移出后再次答错会重新收录、从 0 次开始。</p><button class="button primary" data-action="mistake-paper" ${ids.length || state.progress['mistake-paper'] ? '' : 'disabled'}>${icon('shuffle')}错题独立随机组卷</button></section>` : ''}
+    return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">${mistakes ? 'REVIEW & GROW' : 'YOUR KNOWLEDGE COLLECTION'}</div><h1>${title}</h1><p class="heading-description">${description}</p></div></section>
+${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始')}${choiceFields('collection-sort', '排列方式', [['unit', '按单元顺序'], ['added', mistakes ? '按错题收录顺序' : '按收藏顺序']], collectionSort)}
+      ${mistakes ? `<section class="panel mistake-settings"><form id="mistake-rule-form"><label class="form-field">累计答对几次后移出<input name="target" type="number" min="1" max="100" step="1" required value="${state.mistakeTarget}"></label><button class="button" type="submit">保存规则</button></form><p class="setting-note">可设 1～100 次。修改规则不立即清空错题，下次答对时按新规则判断。移出后再次答错会重新收录、从 0 次开始。</p>${entryControls('mistake-paper', '继续错题组卷', '重新抽取错题卷')}</section>` : ''}
       ${ids.length ? `<div class="bank-toolbar"><div class="tabs" aria-label="按学科筛选">${availableCategories.map(item => `<button class="tab ${listCategory === item ? 'active' : ''}" data-list-category="${item}" aria-pressed="${listCategory === item}">${item === '全部' ? '全部学科' : item}</button>`).join('')}</div><span class="result-count">${questions.length} 道题目</span></div>` : ''}
-      ${questions.length ? `<div class="question-list">${questions.map(question => `<article class="question-list-card"><div class="bank-icon ${question.bankColor}">${icon(question.bankIcon)}</div><div class="question-list-content"><div class="question-labels"><span class="pill">${questionType(question)}</span><span>${question.bankTitle}</span><span>·</span><span>${question.topic}</span></div><h3>${escapeHTML(question.text)}</h3>${mistakes ? `<p class="setting-note">累计答对 ${state.mistakes[question.id].correctCount} / ${state.mistakeTarget} 次</p>` : ''}</div><div class="question-list-actions"><button class="button" data-edit="${question.id}">编辑</button>${mistakes ? `<button class="button" data-remove-mistake="${question.id}">移出错题本</button>` : ''}<button class="icon-button" data-favorite="${question.id}" aria-label="${state.favorites.includes(question.id) ? '取消收藏' : '收藏题目'}" aria-pressed="${state.favorites.includes(question.id)}" ${state.favorites.includes(question.id) ? 'style="color:#bd9252"' : ''}>${icon('star')}</button><button class="button soft" data-question="${question.id}">再练一次${icon('arrow')}</button></div></article>`).join('')}</div>` : emptyState(mistakes ? 'check-circle' : 'star', mistakes ? (ids.length ? '这个学科还没有错题' : '错题本，还是一张白纸') : (ids.length ? '这个学科还没有收藏' : '把有启发的题目，留给未来的自己'), mistakes ? '在练习中遇到的难题会自动出现在这里。不怕答错，每一次尝试都有收获。' : '练习时点击「收藏题目」，就能在这里再次找到它，随时回顾、反复练习。', '去题库看看', 'go-banks')}
+      ${questions.length ? `<div class="question-list">${questions.map(question => `<article class="question-list-card"><div class="bank-icon ${question.bankColor}">${icon(question.bankIcon)}</div><div class="question-list-content"><div class="question-labels"><span class="pill">${questionType(question)}</span><span>${escapeHTML(question.bankTitle)}</span><span>·</span><span>${question.topic}</span></div><h3>${escapeHTML(question.text)}</h3>${mistakes ? `<p class="setting-note">累计答对 ${state.mistakes[question.id].correctCount} / ${state.mistakeTarget} 次</p>` : ''}</div><div class="question-list-actions"><button class="button" data-edit="${question.id}">编辑</button><button class="button" data-add-after="${question.id}">新增题目</button>${mistakes ? `<button class="button" data-remove-mistake="${question.id}">移出错题本</button>` : ''}<button class="icon-button" data-favorite="${question.id}" aria-label="${state.favorites.includes(question.id) ? '取消收藏' : '收藏题目'}" aria-pressed="${state.favorites.includes(question.id)}" ${state.favorites.includes(question.id) ? 'style="color:#bd9252"' : ''}>${icon('star')}</button><button class="button soft" data-question="${question.id}">再练一次${icon('arrow')}</button></div></article>`).join('')}</div>` : emptyState(mistakes ? 'check-circle' : 'star', mistakes ? (ids.length ? '这个学科还没有错题' : '错题本，还是一张白纸') : (ids.length ? '这个学科还没有收藏' : '把有启发的题目，留给未来的自己'), mistakes ? '在练习中遇到的难题会自动出现在这里。不怕答错，每一次尝试都有收获。' : '练习时点击「收藏题目」，就能在这里再次找到它，随时回顾、反复练习。', '去题库看看', 'go-banks')}
     </div>`;
   }
 
-  function openMistakePaper() {
+  function openMistakePaper(restart = false) {
     const ids = getStats().mistakes.filter(id => !QUESTION_MAP.get(id).flags.length);
     const prefs = state.preferences;
-    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">错题独立随机组卷</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭错题组卷">${icon('close')}</button></div>
-      <p class="settings-intro">只从错题本抽取，不混入其他题目、不重复。当前可抽 ${ids.length} 题；格式疑问题不参与组卷。</p><form id="mistake-paper-form">${progressControls('mistake-paper')}<label class="form-field">题目数量<input id="mistake-paper-count" type="number" min="1" max="${Math.max(1, ids.length)}" value="${Math.min(20, ids.length)}" required></label>${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<button type="submit" class="button primary full-width" ${ids.length ? '' : 'disabled'}>开始错题组卷</button></form>`;
-    $('#practice-config-dialog').showModal();
+    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">错题随机组卷</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="mistake-paper-form" data-restart="${restart}"><label class="form-field">抽取数量（可用 ${ids.length} 题）<input id="mistake-paper-count" type="number" min="1" max="${Math.max(1, ids.length)}" value="${Math.min(20, ids.length)}" required></label>${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<button class="button primary" type="submit" ${ids.length ? '' : 'disabled'}>生成并开始</button></form>`;
+    if (!$('#practice-config-dialog').open) $('#practice-config-dialog').showModal();
   }
 
   let collectionSetup = null;
-  function openCollectionSetup(key, ids, title) {
-    collectionSetup = { key, ids, title };
-    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="collection-form">${progressControls(key)}<p class="setting-note">新练习使用当前列表，共 ${ids.length} 题。已有进度保留原题序；列表变化不会重置已保存的练习。</p>${timerFields(state.preferences.timerMode, state.preferences.minutes, 'unit')}<button class="button primary" type="submit">开始 / 继续</button></form>`;
-    $('#practice-config-dialog').showModal();
+  function openCollectionSetup(key, ids, title, restart = false) {
+    collectionSetup = { key, ids, title, restart };
+    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="collection-form">${choiceFields('collection-order', '题目顺序', [['sequence', '顺序'], ['shuffle', '随机']], 'sequence')}<p class="setting-note">顺序按当前列表排列，共 ${ids.length} 题。取消设置保留原进度。</p>${timerFields(state.preferences.timerMode, state.preferences.minutes, 'unit')}<button class="button primary" type="submit">开始练习</button></form>`;
+    if (!$('#practice-config-dialog').open) $('#practice-config-dialog').showModal();
+  }
+
+  function enterCollection(key, restart = false) {
+    if (restart && !confirmRestart()) return;
+    if (!restart && continueProgress(key)) return;
+    if (key === 'mistake-paper') return openMistakePaper(restart);
+    const ids = collectionIds(key).filter(id => listCategory === '全部' || QUESTION_MAP.get(id).category === listCategory);
+    const title = key === 'mistakes' ? '错题复习' : '收藏练习';
+    if (restart) openCollectionSetup(key, ids, title, true);
+    else startSession(ids, title, { ...state.preferences, key });
   }
 
   function removeMistake(id) {
@@ -856,16 +1023,16 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
   function renderStatsPage() {
     const stats = getStats();
     const weekCount = getWeek().reduce((sum, day) => sum + day.count, 0);
-    return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">SMALL STEPS, REAL PROGRESS</div><h1>你的努力，都有迹可循。</h1><p class="heading-description">用真实的积累记录成长。已经学习 ${stats.days} 天，探索了 ${stats.unique.size} 道不同的题目。</p></div><button class="button" data-action="export">${icon('download')}导出记录</button></section>${renderStatCards()}
+    return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">SMALL STEPS, REAL PROGRESS</div><h1>你的努力，都有迹可循。</h1><p class="heading-description">用真实的积累记录成长。已经学习 ${stats.days} 天，探索了 ${stats.unique.size} 道不同的题目。</p></div></section>${renderStatCards()}
       <div class="stats-panels"><section class="panel"><h2>本周练习趋势</h2><p class="panel-description">从周一到周日，记录你的每一点积累。</p><div class="week-summary"><strong>${weekCount}</strong><span>道题目</span><span class="week-hint">每日目标 ${state.goal} 题</span></div>${renderWeekChart()}</section>
       <section class="panel"><h2>学科掌握情况</h2><p class="panel-description">按累计已判分题的正确率统计，重复练习也会计入；原文疑问题不计入分母。</p>${BANKS.map(bank => {
         const attempts = state.attempts.filter(attempt => QUESTION_MAP.get(attempt.questionId).bankId === bank.id && attempt.correct !== null);
         const correct = attempts.filter(attempt => attempt.correct === true).length;
-        return `<div class="subject-stat"><div class="bank-icon ${bank.color}">${icon(bank.icon)}</div><div class="subject-stat-content"><div class="subject-stat-name"><span>${bank.title}</span><span>${attempts.length ? `${percent(correct, attempts.length)}% · ${attempts.length} 次` : '尚未开始'}</span></div><div class="progress-track"><span style="width:${percent(correct, attempts.length)}%"></span></div></div></div>`;
+        return `<div class="subject-stat"><div class="bank-icon ${bank.color}">${icon(bank.icon)}</div><div class="subject-stat-content"><div class="subject-stat-name"><span>${escapeHTML(bank.title)}</span><span>${attempts.length ? `${percent(correct, attempts.length)}% · ${attempts.length} 次` : '尚未开始'}</span></div><div class="progress-track"><span style="width:${percent(correct, attempts.length)}%"></span></div></div></div>`;
       }).join('')}</section></div>
       <section class="panel recent-panel"><h2>最近的学习记录</h2><p class="panel-description">展示最近 8 次答题，所有记录仅保存在当前浏览器。</p>${state.attempts.length ? state.attempts.slice(-8).reverse().map(attempt => {
         const question = QUESTION_MAP.get(attempt.questionId);
-        return `<div class="recent-row"><span class="recent-result ${attempt.correct === false ? 'incorrect' : attempt.correct === null ? 'ungraded' : ''}">${icon(attempt.correct === null ? 'help' : attempt.correct ? 'check' : 'close')}</span><div class="recent-content"><h3>${escapeHTML(question.text)}</h3><p>${question.bankTitle} · ${attempt.correct === null ? '原文待核对 · 未判分' : attempt.correct ? '与参考答案一致' : '需要再巩固'}</p></div><time datetime="${new Date(attempt.at).toISOString()}">${new Date(attempt.at).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${new Date(attempt.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time></div>`;
+        return `<div class="recent-row"><span class="recent-result ${attempt.correct === false ? 'incorrect' : attempt.correct === null ? 'ungraded' : ''}">${icon(attempt.correct === null ? 'help' : attempt.correct ? 'check' : 'close')}</span><div class="recent-content"><h3>${escapeHTML(question.text)}</h3><p>${escapeHTML(question.bankTitle)} · ${attempt.correct === null ? '原文待核对 · 未判分' : attempt.correct ? '与参考答案一致' : '需要再巩固'}</p></div><time datetime="${new Date(attempt.at).toISOString()}">${new Date(attempt.at).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${new Date(attempt.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time></div>`;
       }).join('') : `<div style="padding:35px 0 15px;text-align:center"><p class="panel-description">还没有学习记录。完成第一道题，让成长从这里开始。</p><button class="button soft" style="margin-top:15px" data-action="daily">开始第一次练习${icon('arrow')}</button></div>`}</section>
       ${renderSessionHistory()}
     </div>`;
@@ -932,15 +1099,15 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     openPractice(); return true;
   }
 
-  function progressControls(key) {
+  function entryControls(key, resume, restart) {
     const saved = state.progress[key];
-    return saved ? `<div class="progress-controls"><p>${escapeHTML(STUDY_MODES[saved.mode] || STUDY_MODES.practice)} · 已完成 ${saved.answers.length} / ${saved.ids.length} 题${saved.status === 'completed' ? ' · 已结束' : ''}</p><div class="backup-actions"><button type="button" class="button primary" data-continue="${key}">${saved.status === 'completed' ? '查看已完成结果' : '继续当前进度'}</button><label class="checkbox-field"><input type="checkbox" name="restart">重新开始（重置本入口进度）</label></div></div>` : '';
+    return `<div class="entry-actions"><button type="button" class="button primary" data-entry-continue="${key}" ${key === 'paper' && !saved ? 'disabled' : ''}>${saved?.status === 'completed' ? '查看结果' : resume}</button><button type="button" class="button" data-entry-restart="${key}">${restart}</button></div>`;
   }
 
   function startSession(ids, title, options = {}) {
     const key = options.key || 'legacy';
     if (state.progress[key] && !options.restart) return continueProgress(key);
-    if (state.progress[key] && !window.confirm('确定重新开始此练习吗？将重置此入口的题序和进度，历史成绩、其他练习与版本不受影响。')) return false;
+    if (state.progress[key] && !options.confirmed && !confirmRestart()) return false;
     if (!ids.length) { showToast('这里暂时没有可练习的题目。', 'help'); return false; }
     if (new Set(ids).size !== ids.length || ids.some(id => !QUESTION_MAP.has(id))) throw new Error('练习题目校验失败。');
     const mode = ['countdown', 'none'].includes(options.timerMode) ? options.timerMode : 'stopwatch';
@@ -1021,22 +1188,65 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     session.timer = Core.pauseClock(session.timer);
     if (reason === 'timeout') session.timer.elapsedMs = Math.min(session.timer.elapsedMs, session.timer.limitMs);
     if (session.mode === 'exam') {
-      session.answers = session.answers.map(answer => ({ ...answer, correct: isCorrect(QUESTION_MAP.get(answer.questionId), answer.selection) }));
-      for (const answer of session.answers) recordAnswer(answer, false);
+      session.answers = Array.from(session.answers, answer => answer?.selection.length ? { ...answer, correct: isCorrect(QUESTION_MAP.get(answer.questionId), answer.selection) } : null);
+      for (const answer of answeredItems(session)) recordAnswer(answer, false);
     }
     session.status = 'completed'; session.reason = reason;
     completedSession = { ...session, reason };
     state.progress[session.key] = completedSession;
     cancelAllAPI();
-    state.papers.push({ title: session.title, total: session.ids.length, answered: session.answers.length,
-      correct: session.answers.filter(answer => answer.correct === true).length,
-      graded: session.answers.filter(answer => answer.correct !== null).length,
+    state.papers.push({ title: session.title, total: session.ids.length, answered: answeredItems(session).length,
+      correct: session.answers.filter(answer => answer?.correct === true).length,
+      graded: session.answers.filter(answer => answer && answer.correct !== null).length,
       elapsedMs: session.timer.elapsedMs, at: Date.now(), reason });
     state.papers = state.papers.slice(-100);
     state.session = null;
     clearInterval(sessionInterval);
     saveState(); renderSummary(); renderPage();
     if (!$('#practice-dialog').open) $('#practice-dialog').showModal();
+  }
+
+  function questionNavigation() {
+    const session = state.session;
+    const labels = { unanswered: '未回答', answered: '已回答', correct: '答对', incorrect: '答错', neutral: '' };
+    const numbers = session.ids.map((_, index) => {
+      const answer = session.answers[index];
+      const selection = index === session.index ? currentSelection : answer?.selection ?? session.drafts?.[index] ?? [];
+      const status = session.mode === 'memorize' ? 'neutral' : session.mode === 'practice' && answer?.correct === true ? 'correct'
+        : session.mode === 'practice' && answer?.correct === false ? 'incorrect' : selection.length ? 'answered' : 'unanswered';
+      return `<button type="button" class="question-number status-${status}" data-jump-question="${index}" ${index === session.index ? 'aria-current="step"' : ''} aria-label="第 ${index + 1} 题${labels[status] ? '，' + labels[status] : ''}">${index + 1}</button>`;
+    }).join('');
+    return `<div class="question-picker-heading"><strong id="question-picker-title">选题 · ${session.ids.length} 题</strong><button class="text-button" data-action="toggle-question-picker">收起</button></div>${session.mode === 'memorize' ? '<p class="setting-note">点击题号自由跳转；背题不标记作答颜色。</p>' : `<div class="question-picker-legend"><span class="status-unanswered">未回答</span><span class="status-answered">已回答${session.mode === 'practice' ? ' / 待确认' : ''}</span>${session.mode === 'practice' ? '<span class="status-correct">答对</span><span class="status-incorrect">答错</span>' : ''}</div>`}<div class="question-number-grid">${numbers}</div>`;
+  }
+
+  function toggleQuestionPicker() {
+    const panel = $('#question-picker');
+    if (!panel || !state.session) return;
+    const open = panel.hidden;
+    panel.innerHTML = questionNavigation(); panel.hidden = !open;
+    $('[data-action="toggle-question-picker"]', $('.practice-footer')).setAttribute('aria-expanded', String(open));
+    if (open) {
+      const current = panel.querySelector('[aria-current]');
+      current?.scrollIntoView({ block: 'nearest' });
+      current?.focus({ preventScroll: true });
+    } else $('[data-action="toggle-question-picker"]', $('.practice-footer'))?.focus({ preventScroll: true });
+  }
+
+  function jumpQuestion(index) {
+    if (!state.session || practiceBlocked() || !Number.isInteger(index) || index < 0 || index >= state.session.ids.length) return;
+    moveQuestion(index);
+  }
+
+  function requestFinish(reason = 'complete') {
+    const session = state.session;
+    if (!session) return;
+    if (Core.clockExpired(session.timer)) return finishSession('timeout');
+    if (session.mode === 'exam') saveExamSelection();
+    const unanswered = session.ids.flatMap((_, index) => session.answers[index]?.selection.length ? [] : [index + 1]);
+    if (session.mode !== 'memorize' && unanswered.length) {
+      if (!window.confirm(`还有 ${unanswered.length} 道题未作答或未确认（题号：${unanswered.slice(0, 20).join('、')}${unanswered.length > 20 ? '…' : ''}）。确定提交吗？未作答计 0 分；点击取消可使用“选题”继续作答。`)) return;
+    } else if (reason === 'finish' && !window.confirm('确定结束本次练习吗？已完成的记录会保留。')) return;
+    finishSession(Core.clockExpired(session.timer) ? 'timeout' : reason);
   }
 
   function renderPractice() {
@@ -1052,19 +1262,20 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     const reveal = memorize || Boolean(answer && !exam);
     $('#practice-dialog').innerHTML = `<div class="practice-top"><div class="practice-title-wrap"><h2 id="practice-title">${escapeHTML(session.title)}</h2><p>${question.category} · ${escapeHTML(question.bankTitle)} · ${STUDY_MODES[session.mode]}</p></div><button class="icon-button" data-action="pause-practice" aria-label="保存进度并关闭">${icon('close')}</button></div>
       <div class="timer-bar"><div>${icon('clock')}<strong id="session-clock" role="timer" aria-live="off"></strong>${paused ? '<span class="small-pill">已暂停</span>' : ''}</div><div><button class="text-button" data-action="toggle-clock">${paused ? '继续练习' : '暂停练习'}</button><button class="text-button warning-text" data-action="finish-early">${exam ? '提前交卷' : '结束本次'}</button></div></div>
-      <div class="progress-track practice-progress"><span style="width:${percent(session.answers.length, session.ids.length)}%"></span></div>
-      <div class="practice-scroll">${paused ? '<div class="paused-content"><h3>练习已暂停</h3><p>点击「继续练习」恢复当前题目。</p></div>' : `<div class="practice-body"><div class="practice-meta"><div class="question-labels"><span class="question-type type-${question.type}">${questionType(question)} · ${multiple ? '可选多项' : '只能选一项'}</span><span>原题 ${question.sourceNumber}</span>${exam ? '' : `<button class="text-button" data-edit="${question.id}">编辑题目</button>`}</div><span class="practice-count"><strong>${session.index + 1}</strong> / ${session.ids.length}</span></div>
+      <div class="progress-track practice-progress"><span style="width:${percent(answeredItems(session).length, session.ids.length)}%"></span></div>
+      <div class="practice-scroll">${paused ? '<div class="paused-content"><h3>练习已暂停</h3><p>点击「继续练习」恢复当前题目。</p></div>' : `<div class="practice-body"><div class="practice-meta"><div class="question-labels"><span class="question-type type-${question.type}">${questionType(question)} · ${multiple ? '可选多项' : '只能选一项'}</span><span>第 ${question.position ?? question.sourceNumber} 题</span>${exam ? '' : `<button class="text-button" data-edit="${question.id}">编辑题目</button><button class="text-button" data-add-after="${question.id}">新增题目</button><button class="text-button warning-text" data-delete-question="${question.id}">删除题目</button>`}</div><span class="practice-count"><strong>${session.index + 1}</strong> / ${session.ids.length}</span></div>
       ${flagged ? `<div class="source-warning"><p>${exam ? '本题存在格式疑点，结算时不计分。' : question.flags.map(escapeHTML).join('；') + '。本题不判分。'}</p></div>` : ''}
-      <h3 class="question-title" id="question-title">${escapeHTML(question.text)}</h3><p class="question-hint">${memorize ? '背题模式：正确选项已标出，阅读后点击下一题；不计入正确率或错题消除次数。' : answer ? exam ? '答案已记录，交卷后统一显示结果。' : '判分已直接标注在选项中；解析见下方分析区域。' : multiple ? '请选择所有符合题意的选项，再确认选择。' : '请选择一个选项，再确认选择。'}</p>
+      <h3 class="question-title" id="question-title">${escapeHTML(question.text)}</h3><p class="question-hint">${memorize ? '背题模式：答案已标出，不计成绩；可使用上一题、下一题阅读。' : exam ? '选择会自动保存，点击下一题或选题切换；可返回修改，交卷前不判分。' : answer ? '判分已标注在选项中；解析见下方。' : multiple ? '请选择所有符合题意的选项，再确认选择。' : '请选择一个选项，再确认选择。'}</p>
       <div class="answer-options" role="group" aria-labelledby="question-title">${question.options.map((option, index) => {
         const selected = currentSelection.includes(index);
         const correct = reveal && !flagged && question.answer.includes(index);
         const incorrect = reveal && !flagged && !memorize && selected && !question.answer.includes(index);
-        return `<label class="answer-option ${selected ? 'selected' : ''} ${answer || memorize ? 'locked' : ''} ${correct ? 'correct' : ''} ${incorrect ? 'incorrect' : ''}"><input type="${multiple ? 'checkbox' : 'radio'}" name="practice-answer" value="${index}" ${selected ? 'checked' : ''} ${answer || memorize ? 'disabled' : ''}><span class="option-letter">${escapeHTML(question.optionLabels[index])}</span><span class="option-text">${escapeHTML(option)}</span>${correct ? '<span class="option-verdict">✓ 正确答案</span>' : incorrect ? '<span class="option-verdict">✕ 你的选择</span>' : ''}</label>`;
+        return `<label class="answer-option ${selected ? 'selected' : ''} ${(answer && !exam) || memorize ? 'locked' : ''} ${correct ? 'correct' : ''} ${incorrect ? 'incorrect' : ''}"><input type="${multiple ? 'checkbox' : 'radio'}" name="practice-answer" value="${index}" ${selected ? 'checked' : ''} ${(answer && !exam) || memorize ? 'disabled' : ''}><span class="option-letter">${escapeHTML(question.optionLabels[index])}</span><span class="option-text">${escapeHTML(option)}</span>${correct ? '<span class="option-verdict">✓ 正确答案</span>' : incorrect ? '<span class="option-verdict">✕ 你的选择</span>' : '<span class="option-verdict" aria-hidden="true"></span>'}</label>`;
       }).join('')}</div>
-      ${exam ? '<p class="setting-note exam-notice">考试中隐藏正确答案、解析、编辑及 API 分析，交卷后可逐题查看。纯前端模式仅提供练习体验，不作为防作弊考试系统。</p>' : renderAPIPanel(question, reveal)}
+      ${exam ? '<p class="setting-note exam-notice">考试中隐藏正确答案、解析、编辑及 API 分析，交卷后只显示错误和未作答题的答案与解析。纯前端模式仅提供练习体验，不作为防作弊考试系统。</p>' : renderAPIPanel(question, reveal)}
       </div>`}</div>
-      <div class="practice-footer"><button class="favorite-button ${favorite ? 'active' : ''}" data-practice-favorite="${question.id}" aria-pressed="${favorite}">${icon('star')}<span>${favorite ? '已收藏' : '收藏'}</span></button><div class="practice-footer-right">${answer || memorize ? `<button class="button primary" data-action="next-question" ${paused ? 'disabled' : ''}>${session.index === session.ids.length - 1 ? exam ? '交卷并查看结果' : '完成并查看结果' : '下一题'}${icon('arrow')}</button>` : `<button class="button primary" id="submit-answer" data-action="submit-answer" ${paused || (!flagged && !currentSelection.length) ? 'disabled' : ''}>确认选择${icon('arrow')}</button>`}</div></div>`;
+      <section id="question-picker" class="question-picker" aria-labelledby="question-picker-title" hidden></section>
+      <div class="practice-footer"><div class="practice-footer-left"><button class="favorite-button ${favorite ? 'active' : ''}" data-practice-favorite="${question.id}" aria-pressed="${favorite}">${icon('star')}<span>${favorite ? '已收藏' : '收藏'}</span></button><button class="favorite-button" data-action="toggle-question-picker" aria-expanded="false" aria-controls="question-picker" ${paused ? 'disabled' : ''}>${icon('grid')}<span>选题</span></button></div><div class="practice-footer-right"><button class="button" data-action="previous-question" ${paused || session.index === 0 ? 'disabled' : ''}>上一题</button>${!answer && !memorize && !exam ? `<button class="button primary" id="submit-answer" data-action="submit-answer" ${paused || (!flagged && !currentSelection.length) ? 'disabled' : ''}>确认</button>` : ''}<button class="button ${answer || memorize || exam ? 'primary' : ''}" data-action="next-question" ${paused ? 'disabled' : ''}>${session.index === session.ids.length - 1 ? exam ? '交卷' : '完成' : '下一题'}</button></div></div>`;
     updateSessionClock();
   }
 
@@ -1087,7 +1298,7 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
       questionId: question.id, selection: [...currentSelection].sort((a, b) => a - b),
       correct: session.mode === 'exam' ? null : isCorrect(question, currentSelection), seconds: session.timer.mode === 'none' ? 0 : Math.min(3600, Math.max(1, Math.round(questionElapsed / 1000)))
     };
-    session.answers.push(answer);
+    session.answers[session.index] = answer;
     session.draft = [];
     session.elapsed = 0;
     if (session.mode !== 'exam') recordAnswer(answer);
@@ -1097,39 +1308,69 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     renderSidebar();
   }
 
+  function saveExamSelection() {
+    const session = state.session;
+    if (!session || session.mode !== 'exam') return;
+    const question = QUESTION_MAP.get(session.ids[session.index]);
+    if (!validSelection(currentSelection, question, true)) return;
+    pauseTimer();
+    const previous = session.answers[session.index];
+    session.answers[session.index] = currentSelection.length ? { questionId: question.id, selection: [...currentSelection].sort((a, b) => a - b), correct: null,
+      seconds: previous?.seconds ?? (session.timer.mode === 'none' ? 0 : Math.min(3600, Math.max(1, Math.round(questionElapsed / 1000)))) } : null;
+    session.draft = [...currentSelection];
+    saveState();
+  }
+
+  function moveQuestion(index) {
+    const session = state.session;
+    if (session.mode === 'exam') saveExamSelection();
+    pauseTimer();
+    if (!session.answers[session.index]) {
+      session.drafts ??= {};
+      session.drafts[session.index] = [...currentSelection];
+    }
+    cancelAllAPI();
+    session.index = index;
+    session.draft = [...(session.answers[index]?.selection ?? session.drafts?.[index] ?? [])];
+    currentSelection = [...session.draft];
+    session.elapsed = 0; questionElapsed = 0;
+    activeStartedAt = session.answers[index] ? 0 : Date.now();
+    saveState(); renderPractice();
+    $('#practice-dialog .practice-scroll')?.scrollTo(0, 0);
+    $('#question-title')?.setAttribute('tabindex', '-1');
+    $('#question-title')?.focus({ preventScroll: true });
+  }
+
+  function previousQuestion() {
+    if (practiceBlocked() || state.session.index === 0) return;
+    if (state.session.mode === 'exam' && currentSelection.length) saveExamSelection();
+    moveQuestion(state.session.index - 1);
+  }
+
   function nextQuestion() {
     if (practiceBlocked()) return;
     const session = state.session;
+    if (session.mode === 'exam') saveExamSelection();
     if (session.mode === 'memorize' && !session.answers[session.index]) {
-      session.answers.push({ questionId: session.ids[session.index], selection: [], correct: null, seconds: 0 });
+      session.answers[session.index] = { questionId: session.ids[session.index], selection: [], correct: null, seconds: 0 };
     }
-    if (!session.answers[session.index]) return;
-    if (session.index === session.ids.length - 1) { finishSession('complete'); return; }
-    cancelAllAPI();
-    session.index++;
-    session.draft = [];
-    session.elapsed = 0;
-    currentSelection = [];
-    questionElapsed = 0;
-    activeStartedAt = Date.now();
-    saveState();
-    renderPractice();
-    $('#practice-dialog .practice-scroll')?.scrollTo(0, 0);
-    $('[name="practice-answer"]', $('#practice-dialog'))?.focus({ preventScroll: true });
+    if (session.index === session.ids.length - 1) { requestFinish('complete'); return; }
+    moveQuestion(session.index + 1);
   }
 
   function renderSummary() {
     const session = completedSession;
     if (!session) return;
-    const correct = session.answers.filter(answer => answer.correct === true).length;
-    const graded = session.answers.filter(answer => answer.correct !== null).length;
+    const correct = session.answers.filter(answer => answer?.correct === true).length;
+    const graded = session.answers.filter(answer => answer && answer.correct !== null).length;
     const eligible = session.ids.filter(id => !QUESTION_MAP.get(id).flags.length).length;
     const score = session.mode === 'memorize' || !eligible ? '—' : (correct / eligible * 100).toFixed(1);
-    $('#practice-dialog').innerHTML = `<div class="practice-top"><div class="practice-title-wrap"><h2 id="practice-title">${STUDY_MODES[session.mode]} · ${session.reason === 'timeout' ? '时间到，已交卷' : '本次结果'}</h2><p>${escapeHTML(session.title)}</p></div><button class="icon-button" data-close="practice-dialog" aria-label="关闭结果">${icon('close')}</button></div><div class="practice-scroll"><div class="summary-body"><h3>${session.mode === 'memorize' ? '背题进度已保存，不计成绩。' : `本次得分：${score} / 100`}</h3><p>已完成 ${session.answers.length} / ${session.ids.length} 题。按整卷可判分题等权计分，未作答计 0 分；格式疑问题不计入分母。背题不影响错题累计答对次数。</p><div class="summary-stats"><div><strong>${correct} / ${graded}</strong><span>答对 / 已判分</span></div><div><strong>${session.timer.mode === 'none' ? '不计时' : Core.formatTime(session.timer.elapsedMs)}</strong><span>本次用时</span></div></div><div class="summary-actions"><button class="button primary" data-restart-session="${session.key}">重新开始这组题</button><button class="button" data-action="random">组卷设置</button></div></div>
-      <section class="exam-review"><h3>逐题答案与解析</h3>${session.ids.map((id, index) => {
+    $('#practice-dialog').innerHTML = `<div class="practice-top"><div class="practice-title-wrap"><h2 id="practice-title">${STUDY_MODES[session.mode]} · ${session.reason === 'timeout' ? '时间到，已交卷' : '本次结果'}</h2><p>${escapeHTML(session.title)}</p></div><button class="icon-button" data-close="practice-dialog" aria-label="关闭结果">${icon('close')}</button></div><div class="practice-scroll"><div class="summary-body"><h3>${session.mode === 'memorize' ? '背题进度已保存，不计成绩。' : `本次得分：${score} / 100`}</h3><p>已完成 ${answeredItems(session).length} / ${session.ids.length} 题。按整卷可判分题等权计分，未作答计 0 分；格式疑问题不计入分母。背题不影响错题累计答对次数。</p><div class="summary-stats"><div><strong>${correct} / ${graded}</strong><span>答对 / 已判分</span></div><div><strong>${session.timer.mode === 'none' ? '不计时' : Core.formatTime(session.timer.elapsedMs)}</strong><span>本次用时</span></div></div><div class="summary-actions"><button class="button primary" data-restart-session="${session.key}">重新开始这组题</button></div></div>
+      ${session.mode === 'exam' ? `<section class="exam-review"><h3>错题与未作答题解析</h3>${session.ids.map((id, index) => {
         const question = QUESTION_MAP.get(id), answer = session.answers[index];
+        if (answer?.correct === true || question.flags.length) return '';
         return `<article class="review-question"><div class="question-type type-${question.type}">${questionType(question)} · ${index + 1}</div><h4>${escapeHTML(question.text)}</h4><p>你的选择：${answer?.selection.length ? answer.selection.map(i => escapeHTML(question.optionLabels[i])).join('、') : '未作答 / 背题'} · 判分答案：${escapeHTML(question.referenceAnswer || '缺失')}</p><div class="review-options">${question.options.map((option, i) => `<p class="${question.answer.includes(i) ? 'review-correct' : ''}">${escapeHTML(question.optionLabels[i])}. ${escapeHTML(option)}${question.answer.includes(i) ? ' ✓' : ''}</p>`).join('')}</div><p class="analysis-text">${escapeHTML(question.explanation || '原文未提供逐题解析，可调用 API 辅助核对。')}</p>${question.apiAnalysis ? `<h5>已保存的 API 分析</h5><p class="analysis-text">${escapeHTML(question.apiAnalysis.text)}</p>` : ''}</article>`;
-      }).join('')}</section></div><div class="practice-footer"><button class="button" data-close="practice-dialog">保存结果并关闭</button></div>`;
+      }).join('') || '<p>全部答对，没有需要复盘的错题。</p>'}</section>` : ''}</div><div class="practice-footer"><button class="button" data-close="practice-dialog">关闭结果</button></div>`;
   }
 
   function toggleFavorite(id) {
@@ -1148,11 +1389,11 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
 
   function renderSettings() {
     const selected = PRESETS.find(preset => Object.entries(preset.colors).every(([key, value]) => state.theme[key].toLowerCase() === value));
-    $('#settings-dialog').innerHTML = `<div class="dialog-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">让学习空间，更像你。</h2></div><button class="icon-button" data-close="settings-dialog" aria-label="关闭外观设置">${icon('close')}</button></div><p class="settings-intro">换一种喜欢的颜色，找到自己的学习节奏。所有修改实时生效，并自动保存在本地。</p>
+    $('#settings-dialog').innerHTML = `<div class="dialog-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">设置与偏好</h2></div><button class="icon-button" data-close="settings-dialog" aria-label="关闭外观设置">${icon('close')}</button></div><p class="settings-intro">请按需要配置外观、题库版本和 API。配色与练习进度自动续存；命名版本需要点击保存并勾选内容。</p>
+      ${renderVersionSelector()}<section class="setting-section"><h3>API 与使用帮助</h3><div class="backup-actions"><button class="button" data-action="api">${icon('code')}API 调用设置</button><button class="button" data-action="show-guide">重新查看引导</button></div><p class="setting-note">API 仅在主动请求时联网，可能产生费用，密钥只保存在你选择的本机存储中。</p><button class="danger-link" data-action="reset-data">清空当前版本学习记录</button></section>
       <section class="setting-section"><h3>选择一份心情</h3><div class="preset-grid">${PRESETS.map(preset => `<button class="preset ${selected?.id === preset.id ? 'active' : ''}" data-preset="${preset.id}" aria-pressed="${selected?.id === preset.id}"><span class="preset-swatch"><i style="background:${preset.colors.accent}"></i><i style="background:${preset.colors.background};border:1px solid #00000008"></i></span><span>${preset.name}</span></button>`).join('')}</div></section>
       <section class="setting-section"><h3>自定义界面颜色</h3><div class="color-inputs">${[['accent', '强调色'], ['background', '页面背景'], ['surface', '卡片背景'], ['text', '文字颜色']].map(([key, title]) => `<label class="color-field"><input type="color" data-color="${key}" value="${state.theme[key]}" aria-label="${title}"><span>${title}</span><small class="color-value" data-color-value="${key}">${state.theme[key].toUpperCase()}</small></label>`).join('')}</div><p class="setting-note" id="contrast-note">按钮文字会随强调色自动适配。建议为文字与背景保留足够的对比度。</p></section>
       <section class="setting-section"><h3>每日练习目标</h3><label class="goal-row"><input type="range" id="goal-input" min="5" max="100" step="1" value="${state.goal}" aria-label="每日练习题数"><output class="goal-value" for="goal-input">${state.goal} 题</output></label><p class="setting-note">按自己的节奏来，少一点也没关系。完成一道题就会计入今日目标。</p></section>
-      <section class="setting-section"><h3>题库与解析 JSON</h3><div class="backup-actions"><button class="button" data-action="export">${icon('download')}导出 JSON</button><button class="button" data-action="import">${icon('notebook')}导入 JSON</button><button class="button" data-action="api">${icon('code')}API 调用</button></div><p class="setting-note">导出包含修改后的题目、手写解析、API 分析与学习记录，不含接口配置和密钥。导入作为同一读本的独立版本保留，通过首页版本选择随时切回默认版，各版本进度独立。只有你主动调用 API 时才会发送当前题到配置的服务商。</p><button class="danger-link" data-action="reset-data">清空学习记录</button></section>
       <div class="settings-footer"><button class="button ghost" data-action="reset-theme">${icon('reset')}恢复默认配色</button><button class="button primary" data-close="settings-dialog">完成设置${icon('check')}</button></div>`;
     updateContrastNote();
   }
@@ -1169,12 +1410,17 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
   }
 
   function exportBackup() {
+    // 本地草稿可能包含自定义题目、单独失败的学习记录；恢复导出必须一起保留。
     if (preserveUnreadLibrary) {
       try {
-        const saved = localStorage.getItem('zhixu-library-versions-v1') || localStorage.getItem(LIBRARY_KEY);
-        if (!saved) return showToast('没有可导出的原存储内容。', 'help');
-        downloadFile(saved, `知序-待读取存储副本-${todayKey()}.json`, 'application/json;charset=utf-8');
-        showToast('已导出未改动的原存储副本，格式仍需核验；不会用默认题库覆盖它。');
+        const stored = {};
+        for (let index = 0; index < localStorage.length; index++) {
+          const key = localStorage.key(index);
+          if (key === 'zhixu-library-versions-v1' || key === LIBRARY_KEY || key.startsWith('zhixu-library-draft-v1-') || key.startsWith('zhixu-study-v')) stored[key] = localStorage.getItem(key);
+        }
+        if (!Object.keys(stored).length) return showToast('没有可导出的原存储内容。', 'help');
+        downloadFile(JSON.stringify({ format: 'zhixu-storage-recovery', stored }, null, 2), `知序-待读取存储副本-${todayKey()}.json`, 'application/json;charset=utf-8');
+        showToast('已导出原题库、草稿和学习存储，未包含 API 配置；这是恢复副本，不是普通导入文件。');
       } catch { showToast('浏览器不允许读取原存储。', 'help'); }
       return;
     }
@@ -1225,7 +1471,22 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
   }
 
   const actions = {
-    theme: () => { renderSettings(); $('#settings-dialog').showModal(); },
+    theme: () => { pauseForDialog(); renderSettings(); $('#settings-dialog').showModal(); },
+    'save-version': () => openSnapshot(false),
+    'rename-version': () => {
+      if (!repository || repository.activeId === 'default') return;
+      const old = repository.list().find(item => item.id === repository.activeId).name;
+      const name = window.prompt('修改版本名称（最多 80 字）', old);
+      if (name === null) return;
+      try { repository.rename(repository.activeId, name); renderSettings(); showToast('名称已修改。'); }
+      catch (error) { showToast(error.message, 'help'); }
+    },
+    'add-bank': () => {
+      const title = window.prompt('新增单元名称（仅保存在当前版本的本机草稿中）');
+      if (!title?.trim()) return;
+      try { persistLibrary(Store.addBank(library, title.trim(), baseline)); expandedUnits.clear(); expandedUnits.add(BANKS.at(-1).id); renderPage(); showToast('已增加单元，可展开新增题目。保存版本时请勾选题库内容。'); }
+      catch (error) { showToast(error.message, 'help'); }
+    },
     help: () => $('#help-dialog').showModal(),
     api: openAPI,
     library: openLibrary,
@@ -1238,6 +1499,7 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     'delete-version': () => {
       if (!repository || repository.activeId === 'default') return;
       if (!window.confirm('确定删除当前导入/修改版本及其进度？建议先导出 JSON。默认版不受影响。')) return;
+      if (!window.confirm('请再次确认：此版本的题库、草稿和学习记录将被删除，其他版本保留。确定继续吗？')) return;
       try { parkSession(); repository.remove(repository.activeId); adoptVersion(); showToast('版本已删除，已切回默认版。'); }
       catch (error) { showToast(error.message, 'help'); }
     },
@@ -1252,16 +1514,17 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
       $('#edit-options').insertAdjacentHTML('beforeend', editorOption(count, '', false, $('#edit-type').value));
     },
     'reset-weights': () => {
-      paperDraft.weights = Array(10).fill(10);
-      $$('[data-weight]').forEach(input => { input.value = '10'; });
+      paperDraft.weights = defaultWeights();
+      $$('[data-weight]').forEach((input, index) => { input.value = paperDraft.weights[index]; });
+      updatePaperPreview();
+    },
+    'reset-type-weights': () => {
+      $$('[data-type-weight]').forEach((input, index) => { input.value = [60, 30, 10][index]; });
       updatePaperPreview();
     },
     'toggle-clock': toggleClock,
-    'finish-early': () => {
-      if (!state.session) return;
-      if (Core.clockExpired(state.session.timer)) { finishSession('timeout'); return; }
-      if (window.confirm('确定结束本次练习吗？未提交的答案不计分，已提交记录会保留。')) finishSession(Core.clockExpired(state.session.timer) ? 'timeout' : 'finish');
-    },
+    'toggle-question-picker': toggleQuestionPicker,
+    'finish-early': () => requestFinish('finish'),
     'resume-from-config': () => { $('#practice-config-dialog').close(); openPractice(); },
     daily: () => {
       if (!library) return openLibrary();
@@ -1282,11 +1545,12 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     },
     'submit-answer': submitAnswer,
     'next-question': nextQuestion,
+    'previous-question': previousQuestion,
     'pause-practice': () => $('#practice-dialog').close(),
     'review-mistakes': () => openCollectionSetup('mistakes', getStats().mistakes.filter(id => listCategory === '全部' || QUESTION_MAP.get(id).category === listCategory), '错题复习'),
     'review-favorites': () => openCollectionSetup('favorites', state.favorites.filter(id => listCategory === '全部' || QUESTION_MAP.get(id).category === listCategory), '收藏练习'),
     'retry-wrong': () => {
-      const ids = completedSession?.answers.filter(answer => answer.correct === false).map(answer => answer.questionId) ?? [];
+      const ids = completedSession?.answers.filter(answer => answer?.correct === false).map(answer => answer.questionId) ?? [];
       startSession(ids, '错题巩固 · 再进一步');
     },
     'summary-more': () => actions.random(),
@@ -1295,7 +1559,7 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
       applyTheme(); saveState(); renderSettings();
       showToast('已恢复松间绿默认配色。');
     },
-    export: exportBackup,
+    export: () => openSnapshot(true),
     import: () => $('#import-file').click(),
     'reset-data': () => {
       if (!window.confirm('确定清空当前版本的答题记录、错题、收藏和所有练习进度吗？此操作无法撤销，建议先导出备份。其他版本、配色和每日目标保留。')) return;
@@ -1319,13 +1583,54 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     }
   };
 
+  document.addEventListener('toggle', event => {
+    const details = event.target;
+    if (!details.matches?.('[data-bank-details]')) return;
+    if (details.open) { expandedUnits.clear(); expandedUnits.add(details.dataset.bankDetails); }
+    else expandedUnits.delete(details.dataset.bankDetails);
+  }, true);
+
   document.addEventListener('click', event => {
     const target = event.target.closest('button');
     if (!target || target.disabled) return;
+    if (target.dataset.renameBank) { renameBank(target.dataset.renameBank); return; }
+    if (target.dataset.deleteBank) { deleteContent('bank', target.dataset.deleteBank); return; }
+    if (target.dataset.deleteQuestion) { deleteContent('question', target.dataset.deleteQuestion); return; }
+    if (target.hasAttribute('data-jump-question')) { jumpQuestion(Number(target.dataset.jumpQuestion)); return; }
+    if (target.dataset.unitContinue) { enterUnit(target.dataset.unitContinue); return; }
+    if (target.dataset.unitRestart) { enterUnit(target.dataset.unitRestart, true); return; }
+    if (target.dataset.addBankQuestion) { openNewQuestion(target.dataset.addBankQuestion); return; }
+    if (target.dataset.addAfter) { const q = QUESTION_MAP.get(target.dataset.addAfter); if (q) openNewQuestion(q.bankId, q.id); return; }
+    if (target.dataset.entryContinue) {
+      const key = target.dataset.entryContinue;
+      if (key === 'paper') continueProgress(key); else enterCollection(key);
+      return;
+    }
+    if (target.dataset.entryRestart) {
+      const key = target.dataset.entryRestart;
+      if (key === 'paper') {
+        if (!confirmRestart()) return;
+        paperRestartReady = true; updatePaperPreview();
+        $('#paper-restart-note').textContent = '已确认重新抽取，请调整设置后生成；离开前原进度仍然保留。';
+        $('#paper-practice-settings').scrollIntoView({ block: 'start', behavior: 'smooth' });
+        $('#paper-practice-settings').focus({ preventScroll: true });
+      } else enterCollection(key, true);
+      return;
+    }
     if (target.dataset.continue) { continueProgress(target.dataset.continue); return; }
     if (target.dataset.restartSession) {
       const saved = state.progress[target.dataset.restartSession];
-      if (saved) startSession(saved.ids, saved.title, { key: saved.key, restart: true, studyMode: saved.mode, timerMode: saved.timer.mode, minutes: saved.timer.limitMs / 60000 });
+      if (saved) {
+        if (!confirmRestart()) return;
+        $('#practice-dialog').close();
+        if (saved.key.startsWith('unit:')) openUnitSetup(saved.key.slice(5), true);
+        else if (saved.key === 'paper') {
+          paperRestartReady = true;
+          if (currentRoute !== 'paper') location.hash = 'paper'; else renderPage();
+          requestAnimationFrame(() => $('#paper-practice-settings')?.scrollIntoView({ block: 'start' }));
+        } else if (saved.key === 'mistake-paper') openMistakePaper(true);
+        else openCollectionSetup(saved.key, saved.ids, saved.title, true);
+      }
       return;
     }
     if (target.dataset.edit) { openEditor(target.dataset.edit); return; }
@@ -1374,11 +1679,12 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
   });
 
   document.addEventListener('submit', event => {
+    if (event.target.id === 'snapshot-form') { event.preventDefault(); if (event.target.reportValidity()) saveSnapshot(event.target); return; }
     if (event.target.id === 'collection-form') {
       event.preventDefault();
-      if (!collectionSetup) return;
-      const { ids, key, title } = collectionSetup;
-      try { startSession(ids, title, { key, restart: Boolean(event.target.elements.restart?.checked), studyMode: $('#unit-mode').value, timerMode: $('#unit-timer').value, minutes: Number($('#unit-minutes').value) }); }
+      if (!collectionSetup || !event.target.reportValidity()) return;
+      const { ids, key, title, restart } = collectionSetup;
+      try { startSession(choice('collection-order') === 'shuffle' ? shuffle(ids) : ids, title, { key, restart, confirmed: restart, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) }); }
       catch (error) { showToast(error.message, 'help'); }
       return;
     }
@@ -1392,11 +1698,12 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
         if (!Number.isInteger(target) || target < 1 || target > 100) return;
         state.mistakeTarget = target; saveState(); renderPage(); showToast('错题移出规则已保存，从下次答对起生效。'); return;
       }
-      if (event.target.id === 'mistake-paper-form' && state.progress['mistake-paper'] && !event.target.elements.restart?.checked) { continueProgress('mistake-paper'); return; }
+      const restart = event.target.dataset.restart === 'true';
+      if (event.target.id === 'mistake-paper-form' && state.progress['mistake-paper'] && !restart) { continueProgress('mistake-paper'); return; }
       const ids = getStats().mistakes.filter(id => !QUESTION_MAP.get(id).flags.length);
       const count = Number($('#mistake-paper-count').value);
       if (!Number.isInteger(count) || count < 1 || count > ids.length) return showToast('抽题数量超出当前错题本可用题量。', 'help');
-      try { startSession(shuffle(ids).slice(0, count), `错题独立组卷 · ${count} 题`, { key: 'mistake-paper', restart: Boolean(event.target.elements.restart?.checked), studyMode: $('#unit-mode').value, timerMode: $('#unit-timer').value, minutes: Number($('#unit-minutes').value) }); }
+      try { startSession(shuffle(ids).slice(0, count), `错题独立组卷 · ${count} 题`, { key: 'mistake-paper', restart, confirmed: restart, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) }); }
       catch (error) { showToast(error.message, 'help'); }
       return;
     }
@@ -1404,23 +1711,25 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     event.preventDefault();
     try {
       if (event.target.id === 'paper-form') {
-        if (state.progress.paper && !event.target.elements.restart?.checked) { continueProgress('paper'); return; }
+        if (state.progress.paper && !paperRestartReady) { continueProgress('paper'); return; }
         updatePaperPreview();
         if ($('#paper-start').disabled || !event.target.reportValidity()) return;
         const paper = Core.makeConfiguredPaper(BANKS, paperDraft);
-        if (startSession(paper.ids, `随机组题 · ${paper.ids.length} 题`, { ...paperDraft, key: 'paper', restart: Boolean(event.target.elements.restart?.checked) })) {
+        if (startSession(paper.ids, `随机组题 · ${paper.ids.length} 题`, { ...paperDraft, key: 'paper', restart: paperRestartReady, confirmed: paperRestartReady })) {
+          paperRestartReady = false;
           state.preferences = { ...paperDraft, weights: [...paperDraft.weights], typeWeights: [...paperDraft.typeWeights] };
           saveState();
         }
       } else {
         if (!pendingUnit) return;
         const key = `unit:${pendingUnit.id}`;
-        if (state.progress[key] && !event.target.elements.restart?.checked) { continueProgress(key); return; }
+        const restart = event.target.dataset.restart === 'true';
+        if (state.progress[key] && !restart) { continueProgress(key); return; }
         if (!event.target.reportValidity()) return;
         const order = $('[name="unit-order"]:checked').value;
         const ids = pendingUnit.questions.map(question => question.id);
         startSession(order === 'shuffle' ? shuffle(ids) : ids, `${pendingUnit.label} · ${pendingUnit.title} · ${order === 'shuffle' ? '乱序' : '顺序'}`,
-          { key, restart: Boolean(event.target.elements.restart?.checked), studyMode: $('#unit-mode').value, timerMode: $('#unit-timer').value, minutes: Number($('#unit-minutes').value) });
+          { key, restart, confirmed: restart, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) });
       }
     } catch (error) { showToast(error.message, 'help'); }
   });
@@ -1459,13 +1768,20 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
   document.addEventListener('change', event => {
     const input = event.target;
     if (handleAPIField(input)) return;
+    if (input.id === 'edit-type' && addingQuestion) {
+      const boolean = input.value === 'boolean';
+      $('#edit-options').innerHTML = (boolean ? ['正确', '错误'] : ['', '', '', '']).map((text, index) => editorOption(index, text, false, input.value)).join('');
+      $('#editor-form [data-action="add-option"]').hidden = boolean;
+      return;
+    }
     if (input.id === 'library-version') { switchVersion(input.value); return; }
     if (input.id === 'api-preset') {
       if (input.value !== '' && apiPresets[Number(input.value)]) { apiConfig = { ...apiPresets[Number(input.value)].config }; const selected = input.value; openAPI(); $('#api-preset').value = selected; }
       return;
     }
     if (input.closest('#paper-form')) { updatePaperPreview(); return; }
-    if (input.id === 'unit-timer') {
+    if (input.name === 'collection-sort') { collectionSort = input.value; renderPage(); return; }
+    if (input.name === 'unit-timer') {
       const countdown = input.value === 'countdown';
       $('#unit-minutes-field').hidden = !countdown;
       $('#unit-minutes').disabled = !countdown;
@@ -1476,12 +1792,15 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
       sortBy = input.value;
       $('#bank-results').innerHTML = renderBankResults();
     } else if (input.name === 'practice-answer') {
-      if (practiceBlocked() || state.session.mode === 'memorize' || state.session.answers[state.session.index]) return;
+      if (practiceBlocked() || state.session.mode === 'memorize' || state.session.mode !== 'exam' && state.session.answers[state.session.index]) return;
       currentSelection = $$('[name="practice-answer"]:checked', $('#practice-dialog')).map(option => Number(option.value));
       state.session.draft = [...currentSelection];
       saveState();
       $$('.answer-option').forEach(option => option.classList.toggle('selected', $('input', option).checked));
-      $('#submit-answer').disabled = !currentSelection.length && !QUESTION_MAP.get(state.session.ids[state.session.index]).flags.length;
+      if (state.session.mode === 'exam') saveExamSelection();
+      else $('#submit-answer').disabled = !currentSelection.length && !QUESTION_MAP.get(state.session.ids[state.session.index]).flags.length;
+      const picker = $('#question-picker');
+      if (picker && !picker.hidden) picker.innerHTML = questionNavigation();
     } else if (input.id === 'import-file') {
       importBackup(input.files[0]);
       input.value = '';
@@ -1530,12 +1849,12 @@ ${renderVersionSelector()}${state.progress[mistakes ? 'mistakes' : 'favorites'] 
     if ($('#practice-dialog').open && state.session) {
       if (practiceBlocked()) return;
       const answer = state.session.answers[state.session.index];
-      if (/^[1-8]$/.test(event.key) && !answer) {
+      if (/^[1-8]$/.test(event.key) && (!answer || state.session.mode === 'exam')) {
         const option = $(`[name="practice-answer"][value="${Number(event.key) - 1}"]`);
         if (option) { event.preventDefault(); option.click(); option.focus(); }
       } else if (event.key === 'Enter' && !event.target.closest('button')) {
         event.preventDefault();
-        if (answer || state.session.mode === 'memorize') nextQuestion(); else submitAnswer();
+        if (answer || state.session.mode === 'memorize' || state.session.mode === 'exam') nextQuestion(); else submitAnswer();
       }
     } else if (event.key === '/' && !$('dialog[open]')) {
       event.preventDefault();

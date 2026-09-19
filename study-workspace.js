@@ -53,6 +53,8 @@
     const { sourceText, ...saved } = library;
     saved.banks = library.banks.map(bank => ({ ...bank,
       questions: bank.questions.map(question => {
+        // 内置题 raw 从 baseline 恢复；自定义题 raw 没有原始基准，必须原样保存。
+        if (question.id.startsWith('q-custom-')) return { ...question };
         const { raw, ...fields } = question;
         return fields;
       })
@@ -72,6 +74,9 @@
     // 保存独立副本；外部修改 baseline 或 load() 的返回值均不能改变默认版本。
     const original = Store.validateLibrary(baseline, baseline);
     const studyPrefix = `zhixu-study-v3-${encodeURIComponent(original.id)}:`;
+    const draftPrefix = `zhixu-library-draft-v1-${encodeURIComponent(original.id)}:`;
+    // 保存首次成功读取的原值；后续读取不能静默接受其他页面对草稿的修改。
+    const draftRaws = new Map();
     let manifest;
     let manifestRaw = read(MANIFEST_KEY);
 
@@ -82,6 +87,36 @@
     }
 
     function keyFor(id) { return `${studyPrefix}${versionId(id)}`; }
+    function draftKeyFor(id) { return `${draftPrefix}${versionId(id)}`; }
+
+    function readDraft(id) {
+      const raw = read(draftKeyFor(id));
+      if (draftRaws.has(id) && draftRaws.get(id) !== raw) {
+        throw new Error('当前版本草稿已被其他页面更改或损坏，本次操作未保存；请重新载入后重试。');
+      }
+      let library = null;
+      if (raw !== null) {
+        const value = parseJSON(raw, '版本草稿');
+        exactFields(value, ['version', 'libraryId', 'versionId', 'library'], '版本草稿');
+        if (value.version !== 1 || value.libraryId !== original.id || value.versionId !== id) {
+          invalid('版本草稿格式、读本或版本 ID 不匹配，已阻止覆盖。');
+        }
+        library = Store.validateLibrary(value.library, original);
+      }
+      // 读取或校验失败不会更新观察值，也不会触碰持久化存储。
+      draftRaws.set(id, raw);
+      return library;
+    }
+
+    function loadSaved(id) {
+      const entry = find(id);
+      return Store.validateLibrary(entry ? entry.library : original, original);
+    }
+
+    function load(id) {
+      find(id);
+      return readDraft(id) || loadSaved(id);
+    }
 
     function studyJSON(raw, label) {
       const value = plainObject(parseJSON(raw, label), label);
@@ -145,7 +180,10 @@
         storage.setItem(MANIFEST_KEY, serialized);
       } catch (error) {
         if (createdKey !== null) {
-          try { storage.removeItem(createdKey); }
+          try {
+            // 其他页面可能已更新刚创建的 key；失败回滚只能删除本次写入的原值。
+            if (read(createdKey) === study.raw) storage.removeItem(createdKey);
+          }
           catch (cleanupError) {
             throw new Error(`保存失败，且未提交的新学习记录清理失败；当前版本未改变。${error.message}`, { cause: cleanupError });
           }
@@ -169,7 +207,7 @@
         }
         const id = versionId(`v-${token}`);
         // 失败清理后残留的学习记录也不能被下一次导入覆盖。
-        if (!manifest.versions.some(entry => entry.id === id) && read(keyFor(id)) === null) return id;
+        if (!manifest.versions.some(entry => entry.id === id) && read(keyFor(id)) === null && read(draftKeyFor(id)) === null) return id;
       }
       throw new Error('无法生成未使用的安全版本 ID，本次操作未保存；请重试。');
     }
@@ -192,11 +230,13 @@
       const id = newId();
       const next = { ...manifest, activeId: id, versions: [...manifest.versions, { id, name, library: compact(library) }] };
       commit(next, studyRaw === undefined ? undefined : { key: keyFor(id), raw: studyRaw });
+      draftRaws.set(id, null);
       return id;
     }
 
     if (manifestRaw !== null) {
       manifest = validateManifest(parseJSON(manifestRaw, '版本清单'));
+      readDraft(manifest.activeId);
     } else {
       // 仅以清单不存在判断首次迁移。旧 key 永不删除，也不在以后重复读取。
       const legacyLibrary = read(LEGACY_LIBRARY_KEY);
@@ -206,7 +246,10 @@
       const migratedStudy = legacyStudy === null ? undefined : studyJSON(legacyStudy, '旧学习记录');
       manifest = { version: 1, libraryId: original.id, activeId: DEFAULT_ID, versions: [] };
       if (migratedLibrary) addValidated('迁移的本地修改', migratedLibrary, migratedStudy);
-      else commit(manifest, migratedStudy === undefined ? undefined : { key: keyFor(DEFAULT_ID), raw: migratedStudy });
+      else {
+        readDraft(DEFAULT_ID);
+        commit(manifest, migratedStudy === undefined ? undefined : { key: keyFor(DEFAULT_ID), raw: migratedStudy });
+      }
     }
 
     return Object.freeze({
@@ -214,21 +257,73 @@
         return [{ id: DEFAULT_ID, name: '默认原题' }, ...manifest.versions.map(({ id, name }) => ({ id, name }))];
       },
       get activeId() { return manifest.activeId; },
-      load(id = manifest.activeId) {
-        const entry = find(id);
-        return Store.validateLibrary(entry ? entry.library : original, original);
+      load(id = manifest.activeId) { return load(id); },
+      loadSaved(id = manifest.activeId) { return loadSaved(id); },
+      hasDraft(id = manifest.activeId) {
+        find(id);
+        return readDraft(id) !== null;
+      },
+      draftKey(id = manifest.activeId) {
+        find(id);
+        return draftKeyFor(id);
+      },
+      // 草稿是本地自动续存的工作副本，不是命名快照；切走、重开后仍保留。
+      // default 同样可有草稿；loadSaved('default') 始终返回独立的默认原题。
+      saveDraft(library, study, expectedStudyRaw) {
+        const validated = Store.validateLibrary(library, original);
+        const id = manifest.activeId;
+        const serialized = JSON.stringify({ version: 1, libraryId: original.id, versionId: id, library: compact(validated) });
+        const nextStudy = study === undefined ? undefined : serializeStudy(study);
+        assertUnchanged();
+        readDraft(id);
+        assertUnchanged();
+        const studyKey = keyFor(id);
+        // 删除先清理相关进度，再提交题库，避免重开时引用已不存在的题。
+        // 比较原值以保护其他页面；题库写入失败时仅回滚本次写入。
+        if (nextStudy !== undefined && read(studyKey) !== expectedStudyRaw) throw new Error('学习记录已被其他页面更改，删除未保存，请刷新后重试。');
+        let wroteStudy = false;
+        try {
+          if (nextStudy !== undefined) { storage.setItem(studyKey, nextStudy); wroteStudy = true; }
+          assertUnchanged();
+          readDraft(id);
+          assertUnchanged();
+          if (nextStudy !== undefined && read(studyKey) !== nextStudy) throw new Error('学习记录在保存期间被其他页面更新，删除未提交，请刷新后重试。');
+          storage.setItem(draftKeyFor(id), serialized);
+        } catch (error) {
+          if (wroteStudy) {
+            try {
+              if (read(studyKey) === nextStudy) {
+                if (expectedStudyRaw === null) storage.removeItem(studyKey);
+                else storage.setItem(studyKey, expectedStudyRaw);
+              }
+            } catch (rollbackError) { throw new Error('题库未删除，但学习记录回滚失败，请先导出恢复副本再刷新。', { cause: rollbackError }); }
+          }
+          throw error;
+        }
+        draftRaws.set(id, serialized);
+        return id;
       },
       select(id) {
-        const entry = find(id);
-        const library = Store.validateLibrary(entry ? entry.library : original, original);
+        assertUnchanged();
+        const library = load(id); // 切换前验证目标版本自己的草稿，失败保持原选择。
         if (manifest.activeId !== id) commit({ ...manifest, activeId: id });
         return library;
       },
+      rename(id, name) {
+        find(id);
+        if (id === DEFAULT_ID) invalid('默认版本不可改名。');
+        const normalizedName = versionName(name);
+        commit({ ...manifest, versions: manifest.versions.map(entry => entry.id === id ? { ...entry, name: normalizedName } : entry) });
+        return id;
+      },
+      // 手动保存并激活新的命名快照；题库由 Store.snapshotLibrary 选择内容/解析，
+      // 仅显式传入 study 时复制进度，省略则新版本从无进度开始；源草稿不删除。
       add(name, library, study) {
         const normalizedName = versionName(name);
         const validated = Store.validateLibrary(library, original);
         return addValidated(normalizedName, validated, study === undefined ? undefined : serializeStudy(study));
       },
+      // 仅兼容旧调用：会直接改快照，且 default 会自动创建“我的修改”。新 UI 必须使用 saveDraft/add。
       update(library) {
         const validated = Store.validateLibrary(library, original);
         if (manifest.activeId === DEFAULT_ID) {
@@ -247,10 +342,14 @@
       remove(id) {
         find(id);
         if (id === DEFAULT_ID) invalid('默认版本不可删除。');
+        readDraft(id); // 已观察的草稿若被其他实例更新，则拒绝删除。
+        if (manifest.activeId === id) readDraft(DEFAULT_ID);
         commit({ ...manifest, activeId: manifest.activeId === id ? DEFAULT_ID : manifest.activeId,
           versions: manifest.versions.filter(entry => entry.id !== id) });
-        // 清单提交即为删除成功；清理失败仅保留不再引用的记录，不回滚已提交清单。
+        // 清单提交即为删除成功；清理失败仅保留不再引用的副本，不回滚已提交清单。
         try { storage.removeItem(keyFor(id)); } catch { /* 保留副本比丢失学习记录安全。 */ }
+        try { storage.removeItem(draftKeyFor(id)); } catch { /* 孤立草稿仍受新 ID 碰撞检查保护。 */ }
+        draftRaws.delete(id);
       }
     });
   }
