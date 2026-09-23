@@ -159,10 +159,19 @@
       }
     }
 
+    function preserveRevisionBackup(key, raw, libraries) {
+      if (raw === null || !original.contentRevision || !libraries.some(library => library.contentRevision !== original.contentRevision)) return;
+      const backupKey = `zhixu-content-backup-${original.id}:${original.contentRevision}:${encodeURIComponent(key)}`;
+      // 首次升级原值只写一次，后续编辑和版本删除不清除此恢复副本。
+      if (read(backupKey) === null) storage.setItem(backupKey, raw);
+    }
+
     // localStorage 的单次 setItem 失败不改变旧值。先写新学习记录，最后提交清单。
     // 这里只会创建空闲 key，回滚永远不删除已有学习记录或旧版迁移副本。
     function commit(next, study) {
       const serialized = JSON.stringify(next);
+      assertUnchanged();
+      if (manifestRaw !== null) preserveRevisionBackup(MANIFEST_KEY, manifestRaw, parseJSON(manifestRaw, '版本清单').versions.map(entry => entry.library));
       assertUnchanged();
       let createdKey = null;
       try {
@@ -276,6 +285,8 @@
         const nextStudy = study === undefined ? undefined : serializeStudy(study);
         assertUnchanged();
         readDraft(id);
+        const oldDraft = draftRaws.get(id);
+        if (oldDraft !== null) preserveRevisionBackup(draftKeyFor(id), oldDraft, [parseJSON(oldDraft, '版本草稿').library]);
         assertUnchanged();
         const studyKey = keyFor(id);
         // 删除先清理相关进度，再提交题库，避免重开时引用已不存在的题。

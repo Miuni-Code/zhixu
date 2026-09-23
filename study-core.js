@@ -195,6 +195,48 @@
     return counts;
   }
 
+  function normalizeExclusions(value) {
+    const result = { excludeAllSelected: false, excludeTrue: false, excludeMastered: false };
+    if (value === undefined) return result;
+    if (value === null || typeof value !== 'object' ||
+        (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+      throw new Error('排除规则须为普通对象。');
+    }
+    for (const key of Object.keys(result)) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      if (typeof value[key] !== 'boolean') throw new Error(`${key} 须为布尔值。`);
+      result[key] = value[key];
+    }
+    return result;
+  }
+
+  function createQuestionFilter(exclusions, masteredIds = []) {
+    const rules = normalizeExclusions(exclusions);
+    if (!Array.isArray(masteredIds) || Array.from(masteredIds).some(id => typeof id !== 'string')) {
+      throw new Error('masteredIds 须为字符串数组。');
+    }
+    const mastered = new Set(masteredIds);
+    return question => {
+      if (!question || typeof question !== 'object') throw new Error('题目列表含无效题目。');
+      if (rules.excludeMastered && mastered.has(question.id)) return false;
+      // 缺失 flags 或空数组表示无已知疑点；异常 flags 也不能用于推断全选或正确。
+      if (question.flags !== undefined && (!Array.isArray(question.flags) || question.flags.length)) return true;
+      const answer = question.answer;
+      if (rules.excludeTrue && question.type === 'boolean' &&
+          Array.isArray(answer) && answer.length === 1 && answer[0] === 0) return false;
+      if (rules.excludeAllSelected && question.type === 'multiple' && Array.isArray(question.options) &&
+          question.options.length >= 2 && Array.isArray(answer) && answer.length === question.options.length &&
+          Array.from(answer).every(index => Number.isInteger(index) && index >= 0 && index < question.options.length) &&
+          new Set(answer).size === question.options.length) return false;
+      return true;
+    };
+  }
+
+  function filterQuestions(questions, exclusions = {}, masteredIds = []) {
+    if (!Array.isArray(questions)) throw new Error('题目列表须为数组。');
+    return questions.filter(createQuestionFilter(exclusions, masteredIds));
+  }
+
   function makePaper(banks, total, weights, includeFlagged = false, random = Math.random) {
     const { ids, counts } = makeConfiguredPaper(banks, { count: total, weights, includeFlagged }, random);
     return { ids, counts };
@@ -238,6 +280,7 @@
     if (!Number.isSafeInteger(count) || count < 1 || count > 10000) throw new Error('抽题数量须为 1～10000 的整数。');
     if (!['unit', 'type', 'combined'].includes(allocationMode)) throw new Error('组卷模式须为 unit、type 或 combined。');
     if (typeof includeFlagged !== 'boolean') throw new Error('includeFlagged 须为布尔值。');
+    const keepQuestion = createQuestionFilter(config.exclusions, config.masteredIds);
     // 只校验当前模式生效的比例，另一维度既不参与配额也不限制抽题。
     if (allocationMode !== 'type') validatePaperWeights(weights, unitCount, '各单元');
     if (allocationMode !== 'unit') validatePaperWeights(typeWeights, 3, '三种题型');
@@ -256,6 +299,8 @@
         // 在统计库存之前拒绝重复 ID，预览和实际抽题都不会虚增可用数量。
         if (seen.has(question.id)) throw new Error(`组题校验失败：题目编号重复（${question.id}）。`);
         seen.add(question.id);
+        // 保留原有重复 ID 校验；排除规则在库存统计和配额计算之前统一生效。
+        if (!keepQuestion(question)) continue;
         pools[unitIndex][typeIndex].push({ id: question.id, unitIndex, typeIndex });
       }
     }
@@ -374,7 +419,8 @@
   }
 
   const api = { TITLES, LABELS, emptyBanks, decodeText, parseText, shuffle, allocate, makePaper,
-    makeConfiguredPaper, previewConfiguredPaper, elapsedTime, pauseClock, resumeClock, clockExpired, formatTime };
+    normalizeExclusions, filterQuestions, makeConfiguredPaper, previewConfiguredPaper,
+    elapsedTime, pauseClock, resumeClock, clockExpired, formatTime };
   root.ZhixuCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);

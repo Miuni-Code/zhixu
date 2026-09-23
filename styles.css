@@ -301,6 +301,12 @@ dialog[open] { animation: dialog-in .2s ease both; }
 .favorite-button { color: var(--muted); font-size: 11px; display: flex; align-items: center; gap: 7px; padding: 8px 0; }
 .favorite-button.active { color: #bd9252; }
 .favorite-button.active .icon { fill: #bd925222; }
+.mastered-button.active { color: var(--accent-dark); border-color: var(--accent); }
+.mastered-button.active .icon { fill: color-mix(in srgb, var(--accent) 12%, transparent); }
+.collection-tabs { margin-bottom: 20px; flex-wrap: wrap; }
+.exclusion-options input[type="checkbox"] { width: 16px; height: 16px; flex: 0 0 16px; margin: 0; accent-color: var(--accent); }
+.exclusion-options span { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 480px) { fieldset.exclusion-options { grid-template-columns: minmax(0, 1fr); } }
 .practice-footer-right { display: flex; align-items: center; gap: 12px; }
 .keyboard-hint { font-size: 9px; color: var(--subtle); }
 .summary-body { text-align: center; padding: 25px 30px 35px; }

@@ -10,6 +10,10 @@
     options: 8, banks: 100, questionsPerBank: 1500, mistakes: 150000
   });
   const TYPE_NAMES = Object.freeze({ single: '单选题', multiple: '多选题', boolean: '判断题' });
+  // 发布文件中的修订清单是唯一更新来源；JSON 备份不能注入修订规则。
+  const RELEASED = typeof module !== 'undefined' && module.exports ? require('./data.js').revision : root.ZHIXU_CONTENT_REVISION;
+  const RELEASE_CHANGES = new Map((RELEASED?.changes ?? []).map(change => [change.next.id, change]));
+  const CONTENT_REVISION = RELEASED?.id ?? '';
   const UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
   const CUSTOM_QUESTION = /^q-custom-[a-z0-9]+(?:-[a-z0-9]+)*$/;
   const CUSTOM_BANK = /^u-custom-[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -244,10 +248,21 @@
     };
   }
 
-  function importedQuestion(input, original) {
+  function isRevisedGrading(question) {
+    const change = RELEASE_CHANGES.get(question?.id);
+    return Boolean(change?.gradingChanged && unchangedQuestion(question, change.next));
+  }
+
+  function importedQuestion(input, original, migrateRevision = false) {
     const baseline = readQuestion(original);
-    const question = readQuestion(input);
+    let question = readQuestion(input);
     if (question.id !== baseline.id || question.sourceNumber !== baseline.sourceNumber) invalid('题目 ID、原题号和顺序必须与内置题库一致。');
+    const published = RELEASE_CHANGES.get(question.id);
+    // 只迁移发布前的已知题面（含早期四题修订）或本次 JSON 的题面；
+    // 保留另行编辑的内容、删除记录和自定义题。当前修订标识下的新编辑不反复覆盖。
+    const matchesPublished = candidate => published && [published.next, ...published.previous].some(known => unchangedQuestion(candidate, known));
+    const releasedRevision = migrateRevision && matchesPublished(baseline) && matchesPublished(question);
+    if (releasedRevision) question = readQuestion(published.next);
     transition(baseline.type, question.type);
     const revision = CONFIRMED_REVISIONS.find(item => matchesRevision(question, item, false) &&
       (matchesRevision(baseline, item, false) || matchesRevision(baseline, item, true)));
@@ -273,13 +288,16 @@
     if (edited !== undefined && typeof edited !== 'boolean') invalid('edited 必须为布尔值。');
     const editedAt = field(input, 'editedAt');
     const normalizedAt = editedAt === undefined ? undefined : timestamp(editedAt, '编辑时间');
-    if (revision || !unchanged || question.explanation !== baseline.explanation || edited === true) {
+    if (releasedRevision) {
+      result.edited = published.next.edited === true;
+      if (published.next.editedAt !== undefined) result.editedAt = timestamp(published.next.editedAt, '修订时间');
+    } else if (revision || !unchanged || question.explanation !== baseline.explanation || edited === true) {
       result.edited = true;
       // JSON 手动修改可能没有时间记录；校验函数不猜测编辑发生的时间。
       if (normalizedAt !== undefined) result.editedAt = normalizedAt;
     }
     const apiAnalysis = revision ? undefined : analysis(field(input, 'apiAnalysis'));
-    if (apiAnalysis !== undefined) result.apiAnalysis = apiAnalysis;
+    if (!releasedRevision && apiAnalysis !== undefined) result.apiAnalysis = apiAnalysis;
     return result;
   }
 
@@ -376,6 +394,10 @@
     object(baseline, '内置题库');
     const id = identifier(field(baseline, 'id'), '题库 ID');
     if (field(raw, 'id') !== id) invalid('只允许导入当前内置题库的备份。');
+    const releasedLibrary = RELEASED?.libraryId === id;
+    const revisionId = field(raw, 'contentRevision');
+    if (revisionId !== undefined && revisionId !== CONTENT_REVISION) invalid('题库内容修订版本不受支持，请使用对应发布版本，已阻止降级覆盖。');
+    const migrateRevision = releasedLibrary && revisionId !== CONTENT_REVISION;
     const originals = array(field(baseline, 'banks'), '内置单元', LIMITS.banks);
     const incoming = array(field(raw, 'banks'), '导入单元', LIMITS.banks);
     if (originals.length !== 10) invalid('baseline 必须完整保留内置十个单元。');
@@ -437,7 +459,7 @@
         if (originalIds.has(questionId)) {
           const expected = survivingQuestions[originalIndex];
           if (!expected || field(expected, 'id') !== questionId) invalid('幸存内置原题不能跨单元移动或改变相对顺序。');
-          result = importedQuestion(question, expected);
+          result = importedQuestion(question, expected, migrateRevision);
           originalIndex++;
         } else result = customQuestion(question);
         if (questionIds.has(result.id)) invalid('题目 ID 不能重复。');
@@ -454,7 +476,8 @@
     if (originalBankIndex !== survivingBanks.length) invalid('缺失的内置单元必须明确记录删除。');
     return { id, title: text(field(baseline, 'title'), '题库标题', LIMITS.title, true),
       sourceText: text(field(baseline, 'sourceText'), '原始读本', LIMITS.sourceText), banks,
-      deletedBankIds: [...deletedBanks], deletedQuestionIds: [...deletedQuestions], total, flagged };
+      deletedBankIds: [...deletedBanks], deletedQuestionIds: [...deletedQuestions], total, flagged,
+      ...(releasedLibrary ? { contentRevision: CONTENT_REVISION } : {}) };
   }
 
   /** 为手动命名快照选择题库内容和解析；baseline 必须是独立的原始内置题库。
@@ -645,7 +668,7 @@
   }
 
   const api = Object.freeze({ validateLibrary, snapshotLibrary, createQuestion, addQuestion, addBank,
-    removeBank, removeQuestion, renameBank, editedQuestion, recordMistake, isConfirmedBlankOption, LIMITS });
+    removeBank, removeQuestion, renameBank, editedQuestion, recordMistake, isConfirmedBlankOption, isRevisedGrading, CONTENT_REVISION, LIMITS });
   root.ZhixuStore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);

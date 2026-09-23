@@ -38,8 +38,8 @@
     return weights;
   }
   const answeredItems = session => session.answers.filter(answer => answer && (session.mode === 'memorize' || answer.selection.length));
-  const defaultPreferences = () => ({ count: 100, weights: defaultWeights(), typeWeights: [60, 30, 10], allocationMode: 'combined', studyMode: 'practice', timerMode: 'stopwatch', minutes: 60, includeFlagged: false });
-  const defaultState = (libraryId = library?.id ?? 'unloaded') => ({ version: 2, libraryId, attempts: [], favorites: [], mistakes: {}, mistakeTarget: 3, goal: 20, theme: { ...PRESETS[0].colors }, session: null, progress: {}, papers: [], preferences: defaultPreferences() });
+  const defaultPreferences = () => ({ count: 100, weights: defaultWeights(), typeWeights: [60, 30, 10], allocationMode: 'combined', studyMode: 'practice', timerMode: 'stopwatch', minutes: 60, includeFlagged: false, exclusions: Core.normalizeExclusions() });
+  const defaultState = (libraryId = library?.id ?? 'unloaded') => ({ version: 2, contentRevision: Store.CONTENT_REVISION, libraryId, attempts: [], favorites: [], mastered: [], mistakes: {}, mistakeTarget: 3, goal: 20, theme: { ...PRESETS[0].colors }, session: null, progress: {}, papers: [], preferences: defaultPreferences() });
   let storageFailed = false;
   let preserveUnreadStorage = false;
   let toastTimer;
@@ -49,6 +49,7 @@
   let searchQuery = '';
   let listCategory = '全部';
   let collectionSort = 'unit';
+  let collectionView = 'favorites';
   let paperRestartReady = false;
   let addingQuestion = null;
   const expandedUnits = new Set();
@@ -131,7 +132,7 @@
     if (!item) return;
     const label = kind === 'bank' ? `单元“${item.title}”及其中 ${item.questions.length} 道题` : `题目“${item.text.slice(0, 70)}”`;
     if (!window.confirm(`确定删除${label}吗？默认单元和原题也允许删除，仅影响当前版本。`)) return;
-    if (!window.confirm('请再次确认删除：相关作答、错题和收藏将移除，包含这些题目的练习进度将清除，未交卷考试不会结算。其他题目的成绩、其他入口与版本保留。建议先导出备份。')) return;
+    if (!window.confirm('请再次确认删除：相关作答、错题、收藏和已掌握标记将移除，包含这些题目的练习进度将清除，未交卷考试不会结算。其他题目的成绩、其他入口与版本保留。建议先导出备份。')) return;
     try {
       parkSession();
       const next = kind === 'bank' ? Store.removeBank(library, id, baseline) : Store.removeQuestion(library, id, baseline);
@@ -216,6 +217,10 @@
     clean.attempts = raw.attempts.filter(attempt => validAnswer(attempt) && Number.isFinite(attempt.at) && attempt.at > 0 && attempt.at <= Date.now() + 60000)
       .map(attempt => ({ ...cleanAnswer(attempt), at: attempt.at }));
     clean.favorites = [...new Set(raw.favorites.filter(id => map.has(id)))];
+    if (raw.mastered !== undefined && (!Array.isArray(raw.mastered) || raw.mastered.length > 150000 || Array.from(raw.mastered).some(id => typeof id !== 'string'))) {
+      throw new Error('已掌握题目记录格式损坏，已阻止覆盖。');
+    }
+    clean.mastered = [...new Set((raw.mastered ?? []).filter(id => map.has(id)))];
     clean.goal = Number.isFinite(raw.goal) ? clamp(Math.round(raw.goal), 5, 100) : 20;
     for (const key of Object.keys(clean.theme)) if (validColor(raw.theme?.[key])) clean.theme[key] = raw.theme[key];
     const preferences = raw.preferences;
@@ -228,6 +233,7 @@
         typeWeights: Array.isArray(preferences.typeWeights) && preferences.typeWeights.length === 3 && preferences.typeWeights.every(n => Number.isFinite(n) && n >= 0 && n <= 100) && Math.abs(preferences.typeWeights.reduce((a, b) => a + b, 0) - 100) < .000001 ? [...preferences.typeWeights] : [60, 30, 10],
         minutes: Number.isInteger(preferences.minutes) ? clamp(preferences.minutes, 1, 1440) : 60, includeFlagged: preferences.includeFlagged === true };
     }
+    clean.preferences.exclusions = Core.normalizeExclusions(preferences?.exclusions);
     clean.papers = Array.isArray(raw.papers) ? raw.papers.filter(paper => paper && Number.isFinite(paper.at) && typeof paper.title === 'string' &&
       Number.isInteger(paper.total) && paper.total > 0 && Number.isInteger(paper.answered) && paper.answered >= 0 && paper.answered <= paper.total &&
       Number.isInteger(paper.correct) && paper.correct >= 0 && Number.isInteger(paper.graded) && paper.graded >= paper.correct && paper.graded <= paper.answered &&
@@ -243,7 +249,7 @@
       const validTimer = timer && ['none', 'stopwatch', 'countdown'].includes(timer.mode) && Number.isFinite(timer.elapsedMs) && timer.elapsedMs >= 0 &&
         (timer.runningSince === null || (Number.isFinite(timer.runningSince) && timer.runningSince > 0 && timer.runningSince <= Date.now() + 60000)) &&
         (timer.mode !== 'countdown' || (Number.isFinite(timer.limitMs) && timer.limitMs >= 60000 && timer.limitMs <= 86400000));
-      const allowedKey = value => typeof value === 'string' && (['paper', 'mistakes', 'mistake-paper', 'favorites', 'daily', 'retry', 'legacy'].includes(value) || value.startsWith('unit:') && expectedLibrary.banks.some(bank => bank.id === value.slice(5)) || value.startsWith('question:') && map.has(value.slice(9)));
+      const allowedKey = value => typeof value === 'string' && (['paper', 'mistakes', 'mistake-paper', 'favorites', 'mastered', 'daily', 'retry', 'legacy'].includes(value) || value.startsWith('unit:') && expectedLibrary.banks.some(bank => bank.id === value.slice(5)) || value.startsWith('question:') && map.has(value.slice(9)));
       const key = allowedKey(session.key) ? session.key : fallbackKey;
       const drafts = {};
       if (session.drafts && typeof session.drafts === 'object' && !Array.isArray(session.drafts)) {
@@ -251,13 +257,27 @@
           if (/^(0|[1-9]\d*)$/.test(index) && Number(index) < session.ids.length && validSelection(selection, map.get(session.ids[Number(index)]), true)) drafts[index] = [...selection];
         }
       }
+      const migrated = session.status !== 'completed' && session.contentRevision !== Store.CONTENT_REVISION;
+      const answers = Array.from(session.answers, answer => {
+        if (answer == null) return null;
+        const question = map.get(answer.questionId);
+        if (migrated && Store.isRevisedGrading(question) && session.mode !== 'memorize') {
+          if (!validSelection(answer.selection, question)) return null;
+          // 历史 attempts、错题和已完成试卷不追溯改分；仅当前未完成进度按新答案核对。
+          return { ...cleanAnswer(answer), correct: session.mode === 'exam' ? null : isCorrect(question, answer.selection) };
+        }
+        return { ...cleanAnswer(answer), ...(session.mode === 'exam' && session.status !== 'completed' ? { correct: null } : {}) };
+      });
       return {
+        contentRevision: session.status === 'completed' ? session.contentRevision === Store.CONTENT_REVISION ? Store.CONTENT_REVISION : 'legacy' : Store.CONTENT_REVISION,
+        revisionUpdated: session.revisionUpdated === true || migrated && session.ids.some(id => Store.isRevisedGrading(map.get(id))),
+        exclusions: Core.normalizeExclusions(session.exclusions),
         key, mode: Object.hasOwn(STUDY_MODES, session.mode) ? session.mode : 'practice',
         status: session.status === 'completed' ? 'completed' : 'active', reason: ['complete', 'timeout', 'finish'].includes(session.reason) ? session.reason : 'complete',
         title: typeof session.title === 'string' ? session.title.slice(0, 120) : '继续练习', ids: [...session.ids], index: session.index,
         drafts, draft: validSelection(session.draft, map.get(session.ids[session.index]), true) ? [...session.draft] : [],
         elapsed: Number.isFinite(session.elapsed) ? clamp(session.elapsed, 0, 86400000) : 0,
-        answers: Array.from(session.answers, answer => answer == null ? null : { ...cleanAnswer(answer), ...(session.mode === 'exam' && session.status !== 'completed' ? { correct: null } : {}) }), timer: validTimer ? { mode: timer.mode, elapsedMs: timer.mode === 'none' ? 0 : Math.min(timer.elapsedMs, 31536000000),
+        answers, timer: validTimer ? { mode: timer.mode, elapsedMs: timer.mode === 'none' ? 0 : Math.min(timer.elapsedMs, 31536000000),
           runningSince: timer.runningSince, limitMs: timer.mode === 'countdown' ? timer.limitMs : 0 } : { mode: 'stopwatch', elapsedMs: 0, runningSince: null, limitMs: 0 }
       };
     }
@@ -285,7 +305,13 @@
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       studySnapshots.set(STORAGE_KEY, saved);
-      return saved ? normalizeState(JSON.parse(saved)) : defaultState();
+      if (!saved) return defaultState();
+      const raw = JSON.parse(saved), restored = normalizeState(raw);
+      if (raw.contentRevision !== Store.CONTENT_REVISION) {
+        const backupKey = `${STORAGE_KEY}:before-${Store.CONTENT_REVISION}`;
+        if (localStorage.getItem(backupKey) === null) localStorage.setItem(backupKey, saved);
+      }
+      return restored;
     } catch {
       storageFailed = true;
       preserveUnreadStorage = true;
@@ -510,7 +536,7 @@
       ${entryControls('paper', '继续进度', '重新抽取')}
       <div class="paper-ratios"><section class="panel" id="unit-weight-panel"><div class="card-heading"><h2>单元抽取比例</h2><button type="button" class="text-button" data-action="reset-weights">恢复默认</button></div><p class="setting-note">合计 100%。新增单元默认 0%，可自行调整。</p><div class="allocation-list">${BANKS.map((bank, index) => `<div class="allocation-row"><label for="weight-${index}">${escapeHTML(bank.title)}<small data-capacity="${index}"></small></label><div class="percent-input"><input id="weight-${index}" data-weight="${index}" type="number" min="0" max="100" step="0.1" value="${draft.weights[index] ?? 0}" required aria-label="${escapeHTML(bank.title)}抽题百分比"><span>%</span></div><output data-quota="${index}">— 题</output></div>`).join('')}</div><div class="allocation-total"><span>比例合计</span><strong id="weight-total">100%</strong></div></section>
       <section class="panel" id="type-weight-panel"><div class="card-heading"><h2>题型抽取比例</h2><button type="button" class="text-button" data-action="reset-type-weights">恢复默认</button></div><p class="setting-note">单选 60%、多选 30%、判断 10%，合计须为 100%。</p>${['单选', '多选', '判断'].map((label, index) => `<label class="form-field">${label}（%）<input data-type-weight="${index}" type="number" min="0" max="100" step="0.1" required value="${draft.typeWeights[index]}"></label>`).join('')}<p class="setting-note">叠加模式同时满足两组比例。库存不足时提示，不自动转移配额。</p></section></div>
-      <section class="panel" id="paper-practice-settings" tabindex="-1"><h2>练习设置</h2><label class="form-field">抽题总数<input type="number" id="paper-count" min="1" max="10000" step="1" value="${draft.count}" required></label>${timerFields(draft.timerMode, draft.minutes, 'paper', draft.studyMode)}<div class="paper-preview" id="paper-preview" role="status"></div><button class="button primary full-width" id="paper-start" type="submit">生成并开始练习${icon('arrow')}</button><p class="setting-note" id="paper-restart-note">${state.progress.paper && !paperRestartReady ? '已有进度。请点击继续进度，或先点击重新抽取确认后生成新卷。' : '设置只在生成成功后用于新练习；取消设置不会重置原进度。'}</p></section></form></div>`;
+      <section class="panel" id="paper-practice-settings" tabindex="-1"><h2>练习设置</h2><label class="form-field">抽题总数<input type="number" id="paper-count" min="1" max="10000" step="1" value="${draft.count}" required></label>${timerFields(draft.timerMode, draft.minutes, 'paper', draft.studyMode, draft.exclusions)}<div class="paper-preview" id="paper-preview" role="status"></div><button class="button primary full-width" id="paper-start" type="submit">生成并开始练习${icon('arrow')}</button><p class="setting-note" id="paper-restart-note">${state.progress.paper && !paperRestartReady ? '已有进度。请点击继续进度，或先点击重新抽取确认后生成新卷。' : '设置只在生成成功后用于新练习；取消设置不会重置原进度。'}</p></section></form></div>`;
   }
 
   function choiceFields(name, legend, choices, selected) {
@@ -519,8 +545,46 @@
 
   function choice(name) { return $(`[name="${name}"]:checked`)?.value; }
 
-  function timerFields(mode, minutes, prefix, studyMode = state.preferences.studyMode) {
-    return `${choiceFields(`${prefix}-mode`, '做题模式', Object.entries(STUDY_MODES), studyMode)}<p class="setting-note">背题直接显示答案；练习确认后判分；考试选择后保留当前题，点击下一题或选题切换，交卷后只复盘错题和未作答题。</p>${choiceFields(`${prefix}-timer`, '计时方式', [['none', '不计时'], ['stopwatch', '正计时'], ['countdown', '倒计时']], mode)}<label class="form-field" id="${prefix}-minutes-field" ${mode === 'countdown' ? '' : 'hidden'}>限时（分钟）<input id="${prefix}-minutes" type="number" min="1" max="1440" step="1" value="${minutes}" ${mode === 'countdown' ? 'required' : 'disabled'}></label>`;
+  function exclusionFields(prefix, exclusions) {
+    const rules = Core.normalizeExclusions(exclusions);
+    return `<fieldset class="choice-group exclusion-options"><legend>去除题目（可多选，也可三项全选）</legend>${[
+      ['excludeAllSelected', '多选题答案为全选'], ['excludeTrue', '判断题答案为正确'], ['excludeMastered', '已掌握题目']
+    ].map(([key, label]) => `<label><input type="checkbox" data-exclusion="${key}" name="${prefix}-${key}" ${rules[key] ? 'checked' : ''}><span>${label}</span></label>`).join('')}</fieldset><p class="setting-note">按当前题库的答案筛选，仅用于新建或重新开始的练习；继续进度保持原题序。标记已掌握不会移走当前题，也不改变成绩或错题记录。</p>`;
+  }
+
+  function readExclusions(form) {
+    return Core.normalizeExclusions(Object.fromEntries($$('[data-exclusion]', form).map(input => [input.dataset.exclusion, input.checked])));
+  }
+
+  function eligibleIds(ids, exclusions) {
+    return Core.filterQuestions(ids.map(id => QUESTION_MAP.get(id)), exclusions, state.mastered).map(question => question.id);
+  }
+
+  function setupIds(form) {
+    if (form.id === 'unit-form') return pendingUnit?.questions.map(question => question.id) ?? [];
+    if (form.id === 'mistake-paper-form') return getStats().mistakes.filter(id => !QUESTION_MAP.get(id).flags.length);
+    return collectionSetup?.ids ?? [];
+  }
+
+  function updateSetupPreview() {
+    const form = $('#practice-config-dialog form');
+    if (!form || !['unit-form', 'collection-form', 'mistake-paper-form'].includes(form.id)) return;
+    const ids = setupIds(form), available = eligibleIds(ids, readExclusions(form));
+    const countInput = $('#mistake-paper-count', form);
+    if (countInput) {
+      countInput.max = String(Math.max(1, available.length));
+      $('#mistake-paper-capacity', form).textContent = String(available.length);
+    }
+    const count = countInput ? Number(countInput.value) : Math.min(available.length, form.id === 'collection-form' ? collectionSetup.limit ?? Infinity : Infinity);
+    const invalid = !available.length || !Number.isInteger(count) || count < 1 || count > available.length;
+    const preview = $('[data-exclusion-preview]', form);
+    preview.textContent = `共 ${ids.length} 题，去除 ${ids.length - available.length} 题，可用 ${available.length} 题。${!available.length ? '没有剩余题目，请取消部分排除条件。' : invalid ? '抽取数量超出筛选后的库存，请减少题量。' : `本次练习 ${count} 题。`}取消设置保留原进度。`;
+    preview.classList.toggle('warning-text', invalid);
+    $('[type="submit"]', form).disabled = invalid;
+  }
+
+  function timerFields(mode, minutes, prefix, studyMode = state.preferences.studyMode, exclusions = state.preferences.exclusions) {
+    return `${choiceFields(`${prefix}-mode`, '做题模式', Object.entries(STUDY_MODES), studyMode)}<p class="setting-note">背题直接显示答案；练习确认后判分；考试选择后保留当前题，点击下一题或选题切换，交卷后只复盘错题和未作答题。</p>${choiceFields(`${prefix}-timer`, '计时方式', [['none', '不计时'], ['stopwatch', '正计时'], ['countdown', '倒计时']], mode)}<label class="form-field" id="${prefix}-minutes-field" ${mode === 'countdown' ? '' : 'hidden'}>限时（分钟）<input id="${prefix}-minutes" type="number" min="1" max="1440" step="1" value="${minutes}" ${mode === 'countdown' ? 'required' : 'disabled'}></label>${exclusionFields(prefix, exclusions)}`;
   }
 
   function updatePaperPreview() {
@@ -537,20 +601,21 @@
     $$('[data-type-weight]').forEach(input => { input.disabled = paperDraft.allocationMode === 'unit'; });
     paperDraft.minutes = Number($('#paper-minutes').value);
     paperDraft.includeFlagged = false;
+    paperDraft.exclusions = readExclusions($('#paper-form'));
     const countdown = paperDraft.timerMode === 'countdown';
     $('#paper-minutes-field').hidden = !countdown;
     $('#paper-minutes').disabled = !countdown;
     $('#paper-minutes').required = countdown;
     const sum = paperDraft.weights.reduce((total, weight) => total + weight, 0);
     $('#weight-total').textContent = Number.isFinite(sum) ? `${Math.round(sum * 1000) / 1000}%` : '—';
-    const capacities = BANKS.map(bank => bank.questions.filter(question => paperDraft.includeFlagged || !question.flags.length).length);
+    const capacities = BANKS.map(bank => Core.filterQuestions(bank.questions, paperDraft.exclusions, state.mastered).filter(question => paperDraft.includeFlagged || !question.flags.length).length);
     $$('[data-capacity]').forEach((output, index) => { output.textContent = `可抽 ${capacities[index]} 题`; });
     const preview = $('#paper-preview');
     try {
-      const { counts, typeCounts } = Core.previewConfiguredPaper(BANKS, paperDraft);
+      const { counts, typeCounts } = Core.previewConfiguredPaper(BANKS, { ...paperDraft, masteredIds: state.mastered });
       if (countdown && (!Number.isInteger(paperDraft.minutes) || paperDraft.minutes < 1 || paperDraft.minutes > 1440)) throw new Error('倒计时须为 1～1440 分钟的整数。');
       $$('[data-quota]').forEach((output, index) => { output.textContent = counts ? `${counts[index]} 题` : '随机'; });
-      preview.textContent = `将抽取 ${paperDraft.count} 题。${typeCounts ? `单选 ${typeCounts[0]} / 多选 ${typeCounts[1]} / 判断 ${typeCounts[2]}。` : '题型不限制。'}${counts ? `覆盖 ${counts.filter(Boolean).length} 个单元。` : '跨单元随机。'}${countdown ? `限时 ${paperDraft.minutes} 分钟。` : paperDraft.timerMode === 'none' ? '不计时。' : '记录用时。'}`;
+      preview.textContent = `筛选后可抽 ${capacities.reduce((a, b) => a + b, 0)} 题，将抽取 ${paperDraft.count} 题。${typeCounts ? `单选 ${typeCounts[0]} / 多选 ${typeCounts[1]} / 判断 ${typeCounts[2]}。` : '题型不限制。'}${counts ? `覆盖 ${counts.filter(Boolean).length} 个单元。` : '跨单元随机。'}${countdown ? `限时 ${paperDraft.minutes} 分钟。` : paperDraft.timerMode === 'none' ? '不计时。' : '记录用时。'}`;
       preview.classList.remove('invalid');
       $('#paper-start').disabled = Boolean(state.progress.paper && !paperRestartReady);
     } catch (error) {
@@ -566,7 +631,8 @@
     pendingUnit = BANKS.find(bank => bank.id === id);
     if (!pendingUnit?.questions.length) return;
     const prefs = state.preferences;
-    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(pendingUnit.title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭练习设置">${icon('close')}</button></div><form id="unit-form" data-restart="${restart}">${choiceFields('unit-order', '题目顺序', [['sequence', '顺序'], ['shuffle', '随机']], 'sequence')}${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<p class="setting-note">共 ${pendingUnit.questions.length} 题。取消设置保留原有进度。</p><button class="button primary full-width" type="submit">开始练习${icon('arrow')}</button></form>`;
+    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(pendingUnit.title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭练习设置">${icon('close')}</button></div><form id="unit-form" data-restart="${restart}">${choiceFields('unit-order', '题目顺序', [['sequence', '顺序'], ['shuffle', '随机']], 'sequence')}${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<p class="setting-note" data-exclusion-preview role="status"></p><button class="button primary full-width" type="submit">开始练习${icon('arrow')}</button></form>`;
+    updateSetupPreview();
     if (!$('#practice-config-dialog').open) $('#practice-config-dialog').showModal();
   }
 
@@ -578,7 +644,7 @@
       if (!confirmRestart()) return;
       openUnitSetup(id, true);
     } else if (!continueProgress(key)) {
-      startSession(bank.questions.map(question => question.id), `${bank.label} · ${bank.title}`, { ...state.preferences, key });
+      openUnitSetup(id);
     }
   }
 
@@ -588,13 +654,13 @@
 
   function renderVersionSelector() {
     if (!repository) return `<section class="setting-section"><h3>题库存储恢复</h3><p class="warning-text">${escapeHTML(libraryError || '版本存储尚未恢复，请先保留恢复副本。')}</p><button class="button" data-action="export">导出恢复副本</button></section>`;
-    return `<section class="setting-section" id="version-settings"><h3>当前题库版本</h3><label class="form-field">选择版本<select id="library-version">${repository.list().map(item => `<option value="${escapeHTML(item.id)}" ${item.id === repository.activeId ? 'selected' : ''}>${escapeHTML(item.name)}</option>`).join('')}</select></label><div class="backup-actions"><button class="button primary" data-action="save-version">保存版本</button><button class="button" data-action="rename-version" ${repository.activeId === 'default' ? 'disabled' : ''}>修改名称</button><button class="button" data-action="delete-version" ${repository.activeId === 'default' ? 'disabled' : ''}>删除版本</button><button class="button" data-action="export">导出 JSON</button><button class="button" data-action="import">导入 JSON</button></div><p class="setting-note">题目修改与进度自动续存为本机工作草稿，不会自动创建命名版本。保存版本时按勾选项创建快照；未勾选的进度、用户解析和自定义内容不写入快照。原始读本基准及四题修订保留，当前版本中的默认单元和题目也可删改。导出也按勾选内容生成，不包含接口配置或密钥。</p></section>`;
+    return `<section class="setting-section" id="version-settings"><h3>当前题库版本</h3><label class="form-field">选择版本<select id="library-version">${repository.list().map(item => `<option value="${escapeHTML(item.id)}" ${item.id === repository.activeId ? 'selected' : ''}>${escapeHTML(item.name)}</option>`).join('')}</select></label><div class="backup-actions"><button class="button primary" data-action="save-version">保存版本</button><button class="button" data-action="rename-version" ${repository.activeId === 'default' ? 'disabled' : ''}>修改名称</button><button class="button" data-action="delete-version" ${repository.activeId === 'default' ? 'disabled' : ''}>删除版本</button><button class="button" data-action="export">导出 JSON</button><button class="button" data-action="import">导入 JSON</button></div><p class="setting-note">题目修改与进度自动续存为本机工作草稿，不会自动创建命名版本。保存版本时按勾选项创建快照；未勾选的进度、用户解析和自定义内容不写入快照。内置题库已同步 2026-09-23 JSON 修订，判分以其中的答案字段为准；解析中保留的旧读本答案仅供对照。历史成绩不追溯改分；旧进度会保留，已不适用新题型的选择需重新作答。当前版本中的默认单元和题目仍可删改。导出也按勾选内容生成，不包含接口配置或密钥。</p></section>`;
   }
 
   function openSnapshot(exporting = false) {
     if (preserveUnreadLibrary || preserveUnreadStorage) return exporting ? exportBackup() : showToast('存储已保护，请先导出恢复副本。', 'help');
     pauseForDialog();
-    $('#snapshot-dialog').innerHTML = `<div class="dialog-heading"><h2>${exporting ? '导出 JSON' : '保存版本'}</h2><button class="icon-button" data-close="snapshot-dialog" aria-label="关闭">${icon('close')}</button></div><form id="snapshot-form" data-export="${exporting}">${exporting ? '' : '<label class="form-field">版本名称<input name="name" required maxlength="80" placeholder="例如：第一轮复习"></label>'}<fieldset class="snapshot-options"><legend>选择保存内容（默认均不选）</legend><label class="checkbox-field"><input type="checkbox" name="content">题库内容：单元改名、题面和答案修改、新增及删除的单元和题目</label><label class="checkbox-field"><input type="checkbox" name="analysis">解析：手写解析和 API 分析</label><label class="checkbox-field"><input type="checkbox" name="progress">学习进度：作答、错题、收藏、组卷与续做记录</label></fieldset><p class="setting-note">未选题库内容时使用默认读本。解析与进度只保留题面及答案仍一致的题目；不兼容的整组进度不复制。原草稿不受影响。</p><p id="snapshot-error" class="warning-text" role="alert"></p><button class="button primary" type="submit">${exporting ? '生成文件' : '保存为新版本'}</button></form>`;
+    $('#snapshot-dialog').innerHTML = `<div class="dialog-heading"><h2>${exporting ? '导出 JSON' : '保存版本'}</h2><button class="icon-button" data-close="snapshot-dialog" aria-label="关闭">${icon('close')}</button></div><form id="snapshot-form" data-export="${exporting}">${exporting ? '' : '<label class="form-field">版本名称<input name="name" required maxlength="80" placeholder="例如：第一轮复习"></label>'}<fieldset class="snapshot-options"><legend>选择保存内容（默认均不选）</legend><label class="checkbox-field"><input type="checkbox" name="content">题库内容：单元改名、题面和答案修改、新增及删除的单元和题目</label><label class="checkbox-field"><input type="checkbox" name="analysis">解析：手写解析和 API 分析</label><label class="checkbox-field"><input type="checkbox" name="progress">学习进度：作答、错题、收藏、已掌握、排除条件、组卷与续做记录</label></fieldset><p class="setting-note">未选题库内容时使用默认读本。解析与进度只保留题面及答案仍一致的题目；不兼容的整组进度不复制。原草稿不受影响。</p><p id="snapshot-error" class="warning-text" role="alert"></p><button class="button primary" type="submit">${exporting ? '生成文件' : '保存为新版本'}</button></form>`;
     $('#snapshot-dialog').showModal();
   }
 
@@ -609,6 +675,7 @@
     const copied = JSON.parse(JSON.stringify(state));
     copied.attempts = copied.attempts.filter(answer => compatible.has(answer.questionId));
     copied.favorites = copied.favorites.filter(id => compatible.has(id));
+    copied.mastered = copied.mastered.filter(id => compatible.has(id));
     copied.mistakes = Object.fromEntries(Object.entries(copied.mistakes).filter(([id]) => compatible.has(id)));
     copied.progress = Object.fromEntries(Object.entries(copied.progress).filter(([, session]) => session.ids.every(id => compatible.has(id))));
     if (copied.session && !copied.session.ids.every(id => compatible.has(id))) copied.session = null;
@@ -839,12 +906,16 @@
     } catch (error) { $('#api-config-error').textContent = error.message; }
   }
 
+  function revisionAnswerNotice(question) {
+    return Store.isRevisedGrading(question) ? `<p class="setting-note revision-answer-note">当前修订答案：${escapeHTML(question.referenceAnswer)}（2026-09-23 JSON）。以下解析按文件原样保留；如含旧答案说明，以此处修订答案判分。</p>` : '';
+  }
+
   function renderAPIPanel(question, reveal = state.session?.mode === 'memorize' || Boolean(state.session?.answers[state.session.index])) {
     if (state.session?.mode === 'exam') return '';
     const pending = apiJobs.has(question.id), analysis = question.apiAnalysis;
     const evidence = analysis?.evidence;
     return `<section class="question-api"><div class="card-heading"><h4>解析与 API 分析</h4><button class="text-button" data-action="api">接口设置</button></div>
-      ${reveal ? `<p class="analysis-text question-explanation">${escapeHTML(question.explanation || '原文未提供逐题解析。当前按读本参考答案判分，可调用 API 辅助核对；分析不自动修改答案。')}</p>` : '<p class="setting-note">确认选择后显示解析。</p>'}
+      ${reveal ? `${revisionAnswerNotice(question)}<p class="analysis-text question-explanation">${escapeHTML(question.explanation || '未提供逐题解析。当前按题库修订答案判分，可调用 API 辅助核对；分析不自动修改答案。')}</p>` : '<p class="setting-note">确认选择后显示解析。</p>'}
       <p class="setting-note">单题发送，不上传题库或学习记录。分析仅供参考，不自动改答案。</p>
       <div class="backup-actions"><button class="button soft" data-analyze="${question.id}" ${pending || !reveal ? 'disabled' : ''}>${pending ? '正在分析…' : analysis ? '重新分析' : '检验与分析'}</button>${pending ? `<button class="button" data-cancel-api="${question.id}">取消请求</button>` : ''}</div>
       <p role="status" class="setting-note">${escapeHTML(apiMessages.get(question.id) || '')}</p>
@@ -965,7 +1036,7 @@
   function questionType(question) { return Core.LABELS[question.type]; }
 
   function collectionIds(type) {
-    const ids = (type === 'mistakes' ? getStats().mistakes : state.favorites).filter(id => QUESTION_MAP.has(id));
+    const ids = (type === 'mistakes' ? getStats().mistakes : type === 'mastered' ? state.mastered : state.favorites).filter(id => QUESTION_MAP.has(id));
     if (collectionSort === 'unit') {
       const positions = new Map(QUESTIONS.map((question, index) => [question.id, index]));
       ids.sort((a, b) => positions.get(a) - positions.get(b));
@@ -974,32 +1045,35 @@
   }
 
   function renderCollection(type) {
-    const mistakes = type === 'mistakes';
+    const mistakes = type === 'mistakes', mastered = type === 'mastered';
     const ids = collectionIds(type);
     const availableCategories = ['全部', ...new Set(ids.map(id => QUESTION_MAP.get(id).category))];
     if (!availableCategories.includes(listCategory)) listCategory = '全部';
     const questions = ids.map(id => QUESTION_MAP.get(id)).filter(question => listCategory === '全部' || question.category === listCategory);
-    const title = mistakes ? '把每一次错误，变成进步。' : '值得记住的，留在这里。';
-    const description = mistakes ? `答错自动收录，进入错题本后累计答对 ${state.mistakeTarget} 次自动移出；再次答错不清零。手动移出只影响错题本。` : '收藏那些有启发的题目，建立属于自己的知识清单。';
+    const title = mistakes ? '把每一次错误，变成进步。' : mastered ? '已掌握题目' : '值得记住的，留在这里。';
+    const description = mistakes ? `答错自动收录，进入错题本后累计答对 ${state.mistakeTarget} 次自动移出；再次答错不清零。手动移出只影响错题本。` : mastered ? '手动标记熟练的题目，可随时取消掌握。与收藏、错题独立保存；新建练习时可选择排除。' : '收藏那些有启发的题目；熟练的题目可加入已掌握清单，安排后续复习。';
+    const tabs = mistakes ? '' : `<div class="tabs collection-tabs" aria-label="收藏与掌握清单">${[['favorites', '我的收藏', state.favorites.length], ['mastered', '已掌握题目', state.mastered.length]].map(([key, label, count]) => `<button class="tab ${type === key ? 'active' : ''}" data-collection-view="${key}" aria-pressed="${type === key}">${label} · ${count}</button>`).join('')}</div>`;
     return `<div class="page-enter"><section class="page-heading"><div><div class="greeting">${mistakes ? 'REVIEW & GROW' : 'YOUR KNOWLEDGE COLLECTION'}</div><h1>${title}</h1><p class="heading-description">${description}</p></div></section>
-${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始')}${choiceFields('collection-sort', '排列方式', [['unit', '按单元顺序'], ['added', mistakes ? '按错题收录顺序' : '按收藏顺序']], collectionSort)}
+${tabs}${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始')}${choiceFields('collection-sort', '排列方式', [['unit', '按单元顺序'], ['added', mistakes ? '按错题收录顺序' : mastered ? '按掌握标记顺序' : '按收藏顺序']], collectionSort)}
       ${mistakes ? `<section class="panel mistake-settings"><form id="mistake-rule-form"><label class="form-field">累计答对几次后移出<input name="target" type="number" min="1" max="100" step="1" required value="${state.mistakeTarget}"></label><button class="button" type="submit">保存规则</button></form><p class="setting-note">可设 1～100 次。修改规则不立即清空错题，下次答对时按新规则判断。移出后再次答错会重新收录、从 0 次开始。</p>${entryControls('mistake-paper', '继续错题组卷', '重新抽取错题卷')}</section>` : ''}
       ${ids.length ? `<div class="bank-toolbar"><div class="tabs" aria-label="按学科筛选">${availableCategories.map(item => `<button class="tab ${listCategory === item ? 'active' : ''}" data-list-category="${item}" aria-pressed="${listCategory === item}">${item === '全部' ? '全部学科' : item}</button>`).join('')}</div><span class="result-count">${questions.length} 道题目</span></div>` : ''}
-      ${questions.length ? `<div class="question-list">${questions.map(question => `<article class="question-list-card"><div class="bank-icon ${question.bankColor}">${icon(question.bankIcon)}</div><div class="question-list-content"><div class="question-labels"><span class="pill">${questionType(question)}</span><span>${escapeHTML(question.bankTitle)}</span><span>·</span><span>${question.topic}</span></div><h3>${escapeHTML(question.text)}</h3>${mistakes ? `<p class="setting-note">累计答对 ${state.mistakes[question.id].correctCount} / ${state.mistakeTarget} 次</p>` : ''}</div><div class="question-list-actions"><button class="button" data-edit="${question.id}">编辑</button><button class="button" data-add-after="${question.id}">新增题目</button>${mistakes ? `<button class="button" data-remove-mistake="${question.id}">移出错题本</button>` : ''}<button class="icon-button" data-favorite="${question.id}" aria-label="${state.favorites.includes(question.id) ? '取消收藏' : '收藏题目'}" aria-pressed="${state.favorites.includes(question.id)}" ${state.favorites.includes(question.id) ? 'style="color:#bd9252"' : ''}>${icon('star')}</button><button class="button soft" data-question="${question.id}">再练一次${icon('arrow')}</button></div></article>`).join('')}</div>` : emptyState(mistakes ? 'check-circle' : 'star', mistakes ? (ids.length ? '这个学科还没有错题' : '错题本，还是一张白纸') : (ids.length ? '这个学科还没有收藏' : '把有启发的题目，留给未来的自己'), mistakes ? '在练习中遇到的难题会自动出现在这里。不怕答错，每一次尝试都有收获。' : '练习时点击「收藏题目」，就能在这里再次找到它，随时回顾、反复练习。', '去题库看看', 'go-banks')}
+      ${questions.length ? `<div class="question-list">${questions.map(question => `<article class="question-list-card"><div class="bank-icon ${question.bankColor}">${icon(question.bankIcon)}</div><div class="question-list-content"><div class="question-labels"><span class="pill">${questionType(question)}</span><span>${escapeHTML(question.bankTitle)}</span><span>·</span><span>${question.topic}</span></div><h3>${escapeHTML(question.text)}</h3>${mistakes ? `<p class="setting-note">累计答对 ${state.mistakes[question.id].correctCount} / ${state.mistakeTarget} 次</p>` : ''}</div><div class="question-list-actions"><button class="button" data-edit="${question.id}">编辑</button><button class="button" data-add-after="${question.id}">新增题目</button>${mistakes ? `<button class="button" data-remove-mistake="${question.id}">移出错题本</button>` : ''}<button class="icon-button" data-favorite="${question.id}" aria-label="${state.favorites.includes(question.id) ? '取消收藏' : '收藏题目'}" aria-pressed="${state.favorites.includes(question.id)}" ${state.favorites.includes(question.id) ? 'style="color:#bd9252"' : ''}>${icon('star')}</button><button class="button mastered-button ${state.mastered.includes(question.id) ? 'active' : ''}" data-mastered="${question.id}" aria-pressed="${state.mastered.includes(question.id)}">${state.mastered.includes(question.id) ? '取消掌握' : '标记已掌握'}</button><button class="button soft" data-question="${question.id}">再练一次${icon('arrow')}</button></div></article>`).join('')}</div>` : emptyState(mistakes || mastered ? 'check-circle' : 'star', mistakes ? (ids.length ? '这个学科还没有错题' : '错题本，还是一张白纸') : mastered ? (ids.length ? '这个学科还没有已掌握题目' : '还没有标记已掌握的题目') : (ids.length ? '这个学科还没有收藏' : '把有启发的题目，留给未来的自己'), mistakes ? '在练习中遇到的难题会自动出现在这里。不怕答错，每一次尝试都有收获。' : mastered ? '答题时点击收藏右侧的「掌握」，即可加入此清单；再次点击可取消。' : '练习时点击「收藏」，就能在这里再次找到它，随时回顾、反复练习。', '去题库看看', 'go-banks')}
     </div>`;
   }
 
   function openMistakePaper(restart = false) {
     const ids = getStats().mistakes.filter(id => !QUESTION_MAP.get(id).flags.length);
     const prefs = state.preferences;
-    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">错题随机组卷</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="mistake-paper-form" data-restart="${restart}"><label class="form-field">抽取数量（可用 ${ids.length} 题）<input id="mistake-paper-count" type="number" min="1" max="${Math.max(1, ids.length)}" value="${Math.min(20, ids.length)}" required></label>${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<button class="button primary" type="submit" ${ids.length ? '' : 'disabled'}>生成并开始</button></form>`;
+    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">错题随机组卷</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="mistake-paper-form" data-restart="${restart}"><label class="form-field">抽取数量（筛选后可用 <span id="mistake-paper-capacity">${ids.length}</span> 题）<input id="mistake-paper-count" type="number" min="1" max="${Math.max(1, ids.length)}" value="${Math.min(20, ids.length)}" required></label>${timerFields(prefs.timerMode, prefs.minutes, 'unit')}<p class="setting-note" data-exclusion-preview role="status"></p><button class="button primary" type="submit" ${ids.length ? '' : 'disabled'}>生成并开始</button></form>`;
+    updateSetupPreview();
     if (!$('#practice-config-dialog').open) $('#practice-config-dialog').showModal();
   }
 
   let collectionSetup = null;
-  function openCollectionSetup(key, ids, title, restart = false) {
-    collectionSetup = { key, ids, title, restart };
-    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="collection-form">${choiceFields('collection-order', '题目顺序', [['sequence', '顺序'], ['shuffle', '随机']], 'sequence')}<p class="setting-note">顺序按当前列表排列，共 ${ids.length} 题。取消设置保留原进度。</p>${timerFields(state.preferences.timerMode, state.preferences.minutes, 'unit')}<button class="button primary" type="submit">开始练习</button></form>`;
+  function openCollectionSetup(key, ids, title, restart = false, limit = null) {
+    collectionSetup = { key, ids, title, restart, limit };
+    $('#practice-config-dialog').innerHTML = `<div class="dialog-heading"><h2 id="config-title">${escapeHTML(title)}</h2><button class="icon-button" data-close="practice-config-dialog" aria-label="关闭">${icon('close')}</button></div><form id="collection-form">${choiceFields('collection-order', '题目顺序', [['sequence', '顺序'], ['shuffle', '随机']], 'sequence')}<p class="setting-note">顺序按当前列表排列${limit ? `；从筛选后的题目中最多随机抽取 ${limit} 题` : ''}。</p>${timerFields(state.preferences.timerMode, state.preferences.minutes, 'unit')}<p class="setting-note" data-exclusion-preview role="status"></p><button class="button primary" type="submit">开始练习</button></form>`;
+    updateSetupPreview();
     if (!$('#practice-config-dialog').open) $('#practice-config-dialog').showModal();
   }
 
@@ -1008,9 +1082,8 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     if (!restart && continueProgress(key)) return;
     if (key === 'mistake-paper') return openMistakePaper(restart);
     const ids = collectionIds(key).filter(id => listCategory === '全部' || QUESTION_MAP.get(id).category === listCategory);
-    const title = key === 'mistakes' ? '错题复习' : '收藏练习';
-    if (restart) openCollectionSetup(key, ids, title, true);
-    else startSession(ids, title, { ...state.preferences, key });
+    const title = key === 'mistakes' ? '错题复习' : key === 'mastered' ? '已掌握题目复习' : '收藏练习';
+    openCollectionSetup(key, ids, title, restart);
   }
 
   function removeMistake(id) {
@@ -1053,7 +1126,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     });
     $('#page-crumb').textContent = TITLES[currentRoute];
     document.title = `${TITLES[currentRoute]} · 知序`;
-    const renders = { dashboard: renderDashboard, banks: renderBanks, paper: renderPaperPage, mistakes: () => renderCollection('mistakes'), favorites: () => renderCollection('favorites'), stats: renderStatsPage };
+    const renders = { dashboard: renderDashboard, banks: renderBanks, paper: renderPaperPage, mistakes: () => renderCollection('mistakes'), favorites: () => renderCollection(collectionView), stats: renderStatsPage };
     $('#main').innerHTML = renders[currentRoute]();
     if (currentRoute === 'paper') updatePaperPreview();
   }
@@ -1108,13 +1181,17 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     const key = options.key || 'legacy';
     if (state.progress[key] && !options.restart) return continueProgress(key);
     if (state.progress[key] && !options.confirmed && !confirmRestart()) return false;
-    if (!ids.length) { showToast('这里暂时没有可练习的题目。', 'help'); return false; }
     if (new Set(ids).size !== ids.length || ids.some(id => !QUESTION_MAP.has(id))) throw new Error('练习题目校验失败。');
+    const exclusions = Core.normalizeExclusions(options.exclusions ?? state.preferences.exclusions);
+    ids = eligibleIds(ids, exclusions);
+    if (!ids.length) { showToast('筛选后没有可练习题目，请取消部分排除条件。原有进度保持不变。', 'help'); return false; }
     const mode = ['countdown', 'none'].includes(options.timerMode) ? options.timerMode : 'stopwatch';
     const minutes = options.minutes ?? 60;
     if (mode === 'countdown' && (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440)) throw new Error('倒计时须为 1～1440 分钟的整数。');
     parkSession();
-    state.session = { key, mode: Object.hasOwn(STUDY_MODES, options.studyMode) ? options.studyMode : 'practice', status: 'active', ids: [...ids], title, index: 0, answers: [], draft: [], elapsed: 0,
+    state.preferences.exclusions = { ...exclusions };
+    paperDraft.exclusions = { ...exclusions };
+    state.session = { key, exclusions, contentRevision: Store.CONTENT_REVISION, mode: Object.hasOwn(STUDY_MODES, options.studyMode) ? options.studyMode : 'practice', status: 'active', ids: [...ids], title, index: 0, answers: [], draft: [], elapsed: 0,
       timer: { mode, limitMs: mode === 'countdown' ? minutes * 60000 : 0, elapsedMs: 0, runningSince: null } };
     completedSession = null;
     currentSelection = [];
@@ -1265,6 +1342,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
       <div class="progress-track practice-progress"><span style="width:${percent(answeredItems(session).length, session.ids.length)}%"></span></div>
       <div class="practice-scroll">${paused ? '<div class="paused-content"><h3>练习已暂停</h3><p>点击「继续练习」恢复当前题目。</p></div>' : `<div class="practice-body"><div class="practice-meta"><div class="question-labels"><span class="question-type type-${question.type}">${questionType(question)} · ${multiple ? '可选多项' : '只能选一项'}</span><span>第 ${question.position ?? question.sourceNumber} 题</span>${exam ? '' : `<button class="text-button" data-edit="${question.id}">编辑题目</button><button class="text-button" data-add-after="${question.id}">新增题目</button><button class="text-button warning-text" data-delete-question="${question.id}">删除题目</button>`}</div><span class="practice-count"><strong>${session.index + 1}</strong> / ${session.ids.length}</span></div>
       ${flagged ? `<div class="source-warning"><p>${exam ? '本题存在格式疑点，结算时不计分。' : question.flags.map(escapeHTML).join('；') + '。本题不判分。'}</p></div>` : ''}
+      ${session.revisionUpdated ? '<p class="setting-note">本组题目已同步 JSON 修订。历史成绩不重算；当前核对采用新答案，已不适用新题型的选择需重新作答。</p>' : ''}
       <h3 class="question-title" id="question-title">${escapeHTML(question.text)}</h3><p class="question-hint">${memorize ? '背题模式：答案已标出，不计成绩；可使用上一题、下一题阅读。' : exam ? '选择会自动保存，点击下一题或选题切换；可返回修改，交卷前不判分。' : answer ? '判分已标注在选项中；解析见下方。' : multiple ? '请选择所有符合题意的选项，再确认选择。' : '请选择一个选项，再确认选择。'}</p>
       <div class="answer-options" role="group" aria-labelledby="question-title">${question.options.map((option, index) => {
         const selected = currentSelection.includes(index);
@@ -1275,7 +1353,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
       ${exam ? '<p class="setting-note exam-notice">考试中隐藏正确答案、解析、编辑及 API 分析，交卷后只显示错误和未作答题的答案与解析。纯前端模式仅提供练习体验，不作为防作弊考试系统。</p>' : renderAPIPanel(question, reveal)}
       </div>`}</div>
       <section id="question-picker" class="question-picker" aria-labelledby="question-picker-title" hidden></section>
-      <div class="practice-footer"><div class="practice-footer-left"><button class="favorite-button ${favorite ? 'active' : ''}" data-practice-favorite="${question.id}" aria-pressed="${favorite}">${icon('star')}<span>${favorite ? '已收藏' : '收藏'}</span></button><button class="favorite-button" data-action="toggle-question-picker" aria-expanded="false" aria-controls="question-picker" ${paused ? 'disabled' : ''}>${icon('grid')}<span>选题</span></button></div><div class="practice-footer-right"><button class="button" data-action="previous-question" ${paused || session.index === 0 ? 'disabled' : ''}>上一题</button>${!answer && !memorize && !exam ? `<button class="button primary" id="submit-answer" data-action="submit-answer" ${paused || (!flagged && !currentSelection.length) ? 'disabled' : ''}>确认</button>` : ''}<button class="button ${answer || memorize || exam ? 'primary' : ''}" data-action="next-question" ${paused ? 'disabled' : ''}>${session.index === session.ids.length - 1 ? exam ? '交卷' : '完成' : '下一题'}</button></div></div>`;
+      <div class="practice-footer"><div class="practice-footer-left"><button class="favorite-button ${favorite ? 'active' : ''}" data-practice-favorite="${question.id}" aria-pressed="${favorite}">${icon('star')}<span>${favorite ? '已收藏' : '收藏'}</span></button><button class="favorite-button mastered-button ${state.mastered.includes(question.id) ? 'active' : ''}" data-mastered="${question.id}" aria-label="${state.mastered.includes(question.id) ? '取消掌握' : '标记已掌握'}" aria-pressed="${state.mastered.includes(question.id)}">${icon('check-circle')}<span>${state.mastered.includes(question.id) ? '已掌握' : '掌握'}</span></button><button class="favorite-button" data-action="toggle-question-picker" aria-expanded="false" aria-controls="question-picker" ${paused ? 'disabled' : ''}>${icon('grid')}<span>选题</span></button></div><div class="practice-footer-right"><button class="button" data-action="previous-question" ${paused || session.index === 0 ? 'disabled' : ''}>上一题</button>${!answer && !memorize && !exam ? `<button class="button primary" id="submit-answer" data-action="submit-answer" ${paused || (!flagged && !currentSelection.length) ? 'disabled' : ''}>确认</button>` : ''}<button class="button ${answer || memorize || exam ? 'primary' : ''}" data-action="next-question" ${paused ? 'disabled' : ''}>${session.index === session.ids.length - 1 ? exam ? '交卷' : '完成' : '下一题'}</button></div></div>`;
     updateSessionClock();
   }
 
@@ -1365,11 +1443,11 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     const graded = session.answers.filter(answer => answer && answer.correct !== null).length;
     const eligible = session.ids.filter(id => !QUESTION_MAP.get(id).flags.length).length;
     const score = session.mode === 'memorize' || !eligible ? '—' : (correct / eligible * 100).toFixed(1);
-    $('#practice-dialog').innerHTML = `<div class="practice-top"><div class="practice-title-wrap"><h2 id="practice-title">${STUDY_MODES[session.mode]} · ${session.reason === 'timeout' ? '时间到，已交卷' : '本次结果'}</h2><p>${escapeHTML(session.title)}</p></div><button class="icon-button" data-close="practice-dialog" aria-label="关闭结果">${icon('close')}</button></div><div class="practice-scroll"><div class="summary-body"><h3>${session.mode === 'memorize' ? '背题进度已保存，不计成绩。' : `本次得分：${score} / 100`}</h3><p>已完成 ${answeredItems(session).length} / ${session.ids.length} 题。按整卷可判分题等权计分，未作答计 0 分；格式疑问题不计入分母。背题不影响错题累计答对次数。</p><div class="summary-stats"><div><strong>${correct} / ${graded}</strong><span>答对 / 已判分</span></div><div><strong>${session.timer.mode === 'none' ? '不计时' : Core.formatTime(session.timer.elapsedMs)}</strong><span>本次用时</span></div></div><div class="summary-actions"><button class="button primary" data-restart-session="${session.key}">重新开始这组题</button></div></div>
+    $('#practice-dialog').innerHTML = `<div class="practice-top"><div class="practice-title-wrap"><h2 id="practice-title">${STUDY_MODES[session.mode]} · ${session.reason === 'timeout' ? '时间到，已交卷' : '本次结果'}</h2><p>${escapeHTML(session.title)}</p></div><button class="icon-button" data-close="practice-dialog" aria-label="关闭结果">${icon('close')}</button></div><div class="practice-scroll"><div class="summary-body">${session.contentRevision !== Store.CONTENT_REVISION ? '<p class="setting-note">这是修订前的历史结果，成绩按当时记录保留；下方题面、答案与解析为当前修订内容。</p>' : ''}<h3>${session.mode === 'memorize' ? '背题进度已保存，不计成绩。' : `本次得分：${score} / 100`}</h3><p>已完成 ${answeredItems(session).length} / ${session.ids.length} 题。按整卷可判分题等权计分，未作答计 0 分；格式疑问题不计入分母。背题不影响错题累计答对次数。</p><div class="summary-stats"><div><strong>${correct} / ${graded}</strong><span>答对 / 已判分</span></div><div><strong>${session.timer.mode === 'none' ? '不计时' : Core.formatTime(session.timer.elapsedMs)}</strong><span>本次用时</span></div></div><div class="summary-actions"><button class="button primary" data-restart-session="${session.key}">重新开始这组题</button></div></div>
       ${session.mode === 'exam' ? `<section class="exam-review"><h3>错题与未作答题解析</h3>${session.ids.map((id, index) => {
         const question = QUESTION_MAP.get(id), answer = session.answers[index];
         if (answer?.correct === true || question.flags.length) return '';
-        return `<article class="review-question"><div class="question-type type-${question.type}">${questionType(question)} · ${index + 1}</div><h4>${escapeHTML(question.text)}</h4><p>你的选择：${answer?.selection.length ? answer.selection.map(i => escapeHTML(question.optionLabels[i])).join('、') : '未作答 / 背题'} · 判分答案：${escapeHTML(question.referenceAnswer || '缺失')}</p><div class="review-options">${question.options.map((option, i) => `<p class="${question.answer.includes(i) ? 'review-correct' : ''}">${escapeHTML(question.optionLabels[i])}. ${escapeHTML(option)}${question.answer.includes(i) ? ' ✓' : ''}</p>`).join('')}</div><p class="analysis-text">${escapeHTML(question.explanation || '原文未提供逐题解析，可调用 API 辅助核对。')}</p>${question.apiAnalysis ? `<h5>已保存的 API 分析</h5><p class="analysis-text">${escapeHTML(question.apiAnalysis.text)}</p>` : ''}</article>`;
+        return `<article class="review-question"><div class="question-type type-${question.type}">${questionType(question)} · ${index + 1}</div><h4>${escapeHTML(question.text)}</h4><p>你的选择：${answer?.selection.length ? answer.selection.map(i => escapeHTML(question.optionLabels[i])).join('、') : '未作答 / 背题'} · 判分答案：${escapeHTML(question.referenceAnswer || '缺失')}</p><div class="review-options">${question.options.map((option, i) => `<p class="${question.answer.includes(i) ? 'review-correct' : ''}">${escapeHTML(question.optionLabels[i])}. ${escapeHTML(option)}${question.answer.includes(i) ? ' ✓' : ''}</p>`).join('')}</div>${revisionAnswerNotice(question)}<p class="analysis-text">${escapeHTML(question.explanation || '原文未提供逐题解析，可调用 API 辅助核对。')}</p>${question.apiAnalysis ? `<h5>已保存的 API 分析</h5><p class="analysis-text">${escapeHTML(question.apiAnalysis.text)}</p>` : ''}</article>`;
       }).join('') || '<p>全部答对，没有需要复盘的错题。</p>'}</section>` : ''}</div><div class="practice-footer"><button class="button" data-close="practice-dialog">关闭结果</button></div>`;
   }
 
@@ -1383,8 +1461,29 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     if ($('#practice-dialog').open && practiceButton?.dataset.practiceFavorite === id) {
       practiceButton.classList.toggle('active', !exists);
       practiceButton.setAttribute('aria-pressed', String(!exists));
-      $('span', practiceButton).textContent = exists ? '收藏题目' : '已收藏';
+      $('span', practiceButton).textContent = exists ? '收藏' : '已收藏';
     } else renderPage();
+  }
+
+  function toggleMastered(id) {
+    if (!QUESTION_MAP.has(id)) return;
+    const previous = state.mastered, exists = previous.includes(id);
+    state.mastered = exists ? previous.filter(value => value !== id) : [...previous, id];
+    if (!saveState()) {
+      state.mastered = previous;
+      showToast('已掌握标记未能安全保存，已保留原状态。请先导出恢复副本。', 'help');
+      return;
+    }
+    // 只更新按钮，不重绘答题界面，保留选项草稿、题号面板、计时和当前题序。
+    const button = $('#practice-dialog [data-mastered]');
+    if (button?.dataset.mastered === id) {
+      button.classList.toggle('active', !exists);
+      button.setAttribute('aria-pressed', String(!exists));
+      button.setAttribute('aria-label', exists ? '标记已掌握' : '取消掌握');
+      $('span', button).textContent = exists ? '掌握' : '已掌握';
+    }
+    renderPage();
+    showToast(exists ? '已取消掌握标记。现有练习题序保持不变。' : '已加入已掌握题目。新建练习时可选择排除，当前进度保持不变。');
   }
 
   function renderSettings() {
@@ -1416,7 +1515,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
         const stored = {};
         for (let index = 0; index < localStorage.length; index++) {
           const key = localStorage.key(index);
-          if (key === 'zhixu-library-versions-v1' || key === LIBRARY_KEY || key.startsWith('zhixu-library-draft-v1-') || key.startsWith('zhixu-study-v')) stored[key] = localStorage.getItem(key);
+          if (key === 'zhixu-library-versions-v1' || key === LIBRARY_KEY || key.startsWith('zhixu-library-draft-v1-') || key.startsWith('zhixu-content-backup-') || key.startsWith('zhixu-study-v')) stored[key] = localStorage.getItem(key);
         }
         if (!Object.keys(stored).length) return showToast('没有可导出的原存储内容。', 'help');
         downloadFile(JSON.stringify({ format: 'zhixu-storage-recovery', stored }, null, 2), `知序-待读取存储副本-${todayKey()}.json`, 'application/json;charset=utf-8');
@@ -1454,7 +1553,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
       const nextLibrary = Store.validateLibrary(envelope ? raw.library : raw, baseline);
       if (!repository || preserveUnreadLibrary) throw new Error('原版本存储尚未恢复，已阻止导入覆盖。');
       const imported = envelope && raw.study ? normalizeState(raw.study, nextLibrary) : defaultState(nextLibrary.id);
-      if (envelope && raw.study && (imported.attempts.length !== raw.study.attempts?.length || imported.favorites.length !== raw.study.favorites?.length || (raw.study.session && !imported.session))) throw new Error('学习记录格式不完整，未导入。');
+      if (envelope && raw.study && (imported.attempts.length !== raw.study.attempts?.length || imported.favorites.length !== raw.study.favorites?.length || (raw.study.mastered !== undefined && imported.mastered.length !== raw.study.mastered.length) || (raw.study.session && !imported.session))) throw new Error('学习记录格式不完整，未导入。');
       const name = window.prompt('为导入版本命名。原版本保留，可随时切回默认版。', file.name.replace(/\.json$/i, '').slice(0, 80));
       if (!name?.trim()) return;
       if (preserveUnreadStorage) {
@@ -1528,8 +1627,9 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     'resume-from-config': () => { $('#practice-config-dialog').close(); openPractice(); },
     daily: () => {
       if (!library) return openLibrary();
-      const ids = shuffle(QUESTIONS.filter(question => !question.flags.length).map(question => question.id)).slice(0, 10);
-      openCollectionSetup('daily', ids, `每日练习 · ${ids.length} 题`);
+      if (continueProgress('daily')) return;
+      const ids = QUESTIONS.filter(question => !question.flags.length).map(question => question.id);
+      openCollectionSetup('daily', ids, '每日练习 · 最多 10 题', false, 10);
     },
     random: () => {
       if ($('#practice-dialog').open) $('#practice-dialog').close();
@@ -1551,7 +1651,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     'review-favorites': () => openCollectionSetup('favorites', state.favorites.filter(id => listCategory === '全部' || QUESTION_MAP.get(id).category === listCategory), '收藏练习'),
     'retry-wrong': () => {
       const ids = completedSession?.answers.filter(answer => answer?.correct === false).map(answer => answer.questionId) ?? [];
-      startSession(ids, '错题巩固 · 再进一步');
+      openCollectionSetup('retry', ids, '错题巩固 · 再进一步');
     },
     'summary-more': () => actions.random(),
     'reset-theme': () => {
@@ -1562,7 +1662,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     export: () => openSnapshot(true),
     import: () => $('#import-file').click(),
     'reset-data': () => {
-      if (!window.confirm('确定清空当前版本的答题记录、错题、收藏和所有练习进度吗？此操作无法撤销，建议先导出备份。其他版本、配色和每日目标保留。')) return;
+      if (!window.confirm('确定清空当前版本的答题记录、错题、收藏、已掌握和所有练习进度吗？此操作无法撤销，建议先导出备份。其他版本、配色和每日目标保留。')) return;
       try { studySnapshots.set(STORAGE_KEY, localStorage.getItem(STORAGE_KEY)); }
       catch { return showToast('无法读取原记录，未执行清空。', 'help'); }
       preserveUnreadStorage = false;
@@ -1572,6 +1672,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
       cancelAllAPI();
       state.papers = [];
       state.favorites = [];
+      state.mastered = [];
       state.session = null;
       state.progress = {};
       completedSession = null;
@@ -1593,6 +1694,10 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
   document.addEventListener('click', event => {
     const target = event.target.closest('button');
     if (!target || target.disabled) return;
+    if (target.dataset.mastered) { toggleMastered(target.dataset.mastered); return; }
+    if (['favorites', 'mastered'].includes(target.dataset.collectionView)) {
+      collectionView = target.dataset.collectionView; listCategory = '全部'; renderPage(); return;
+    }
     if (target.dataset.renameBank) { renameBank(target.dataset.renameBank); return; }
     if (target.dataset.deleteBank) { deleteContent('bank', target.dataset.deleteBank); return; }
     if (target.dataset.deleteQuestion) { deleteContent('question', target.dataset.deleteQuestion); return; }
@@ -1629,6 +1734,8 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
           if (currentRoute !== 'paper') location.hash = 'paper'; else renderPage();
           requestAnimationFrame(() => $('#paper-practice-settings')?.scrollIntoView({ block: 'start' }));
         } else if (saved.key === 'mistake-paper') openMistakePaper(true);
+        else if (['favorites', 'mastered', 'mistakes'].includes(saved.key)) openCollectionSetup(saved.key, collectionIds(saved.key), saved.title, true);
+        else if (saved.key === 'daily') openCollectionSetup('daily', QUESTIONS.filter(question => !question.flags.length).map(question => question.id), '每日练习 · 最多 10 题', true, 10);
         else openCollectionSetup(saved.key, saved.ids, saved.title, true);
       }
       return;
@@ -1683,8 +1790,17 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     if (event.target.id === 'collection-form') {
       event.preventDefault();
       if (!collectionSetup || !event.target.reportValidity()) return;
-      const { ids, key, title, restart } = collectionSetup;
-      try { startSession(choice('collection-order') === 'shuffle' ? shuffle(ids) : ids, title, { key, restart, confirmed: restart, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) }); }
+      const { ids, key, title, restart, limit } = collectionSetup;
+      try {
+        const exclusions = readExclusions(event.target);
+        let selected = eligibleIds(ids, exclusions);
+        if (limit) {
+          const sampled = new Set(shuffle(selected).slice(0, limit));
+          selected = selected.filter(id => sampled.has(id));
+        }
+        if (choice('collection-order') === 'shuffle') selected = shuffle(selected);
+        startSession(selected, title, { key, restart, confirmed: restart, exclusions, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) });
+      }
       catch (error) { showToast(error.message, 'help'); }
       return;
     }
@@ -1700,10 +1816,11 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
       }
       const restart = event.target.dataset.restart === 'true';
       if (event.target.id === 'mistake-paper-form' && state.progress['mistake-paper'] && !restart) { continueProgress('mistake-paper'); return; }
-      const ids = getStats().mistakes.filter(id => !QUESTION_MAP.get(id).flags.length);
+      const exclusions = readExclusions(event.target);
+      const ids = eligibleIds(getStats().mistakes.filter(id => !QUESTION_MAP.get(id).flags.length), exclusions);
       const count = Number($('#mistake-paper-count').value);
       if (!Number.isInteger(count) || count < 1 || count > ids.length) return showToast('抽题数量超出当前错题本可用题量。', 'help');
-      try { startSession(shuffle(ids).slice(0, count), `错题独立组卷 · ${count} 题`, { key: 'mistake-paper', restart, confirmed: restart, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) }); }
+      try { startSession(shuffle(ids).slice(0, count), `错题独立组卷 · ${count} 题`, { key: 'mistake-paper', restart, confirmed: restart, exclusions, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) }); }
       catch (error) { showToast(error.message, 'help'); }
       return;
     }
@@ -1714,7 +1831,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
         if (state.progress.paper && !paperRestartReady) { continueProgress('paper'); return; }
         updatePaperPreview();
         if ($('#paper-start').disabled || !event.target.reportValidity()) return;
-        const paper = Core.makeConfiguredPaper(BANKS, paperDraft);
+        const paper = Core.makeConfiguredPaper(BANKS, { ...paperDraft, masteredIds: state.mastered });
         if (startSession(paper.ids, `随机组题 · ${paper.ids.length} 题`, { ...paperDraft, key: 'paper', restart: paperRestartReady, confirmed: paperRestartReady })) {
           paperRestartReady = false;
           state.preferences = { ...paperDraft, weights: [...paperDraft.weights], typeWeights: [...paperDraft.typeWeights] };
@@ -1729,7 +1846,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
         const order = $('[name="unit-order"]:checked').value;
         const ids = pendingUnit.questions.map(question => question.id);
         startSession(order === 'shuffle' ? shuffle(ids) : ids, `${pendingUnit.label} · ${pendingUnit.title} · ${order === 'shuffle' ? '乱序' : '顺序'}`,
-          { key, restart, confirmed: restart, studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) });
+          { key, restart, confirmed: restart, exclusions: readExclusions(event.target), studyMode: choice('unit-mode'), timerMode: choice('unit-timer'), minutes: Number($('#unit-minutes').value) });
       }
     } catch (error) { showToast(error.message, 'help'); }
   });
@@ -1747,6 +1864,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
     const input = event.target;
     if (handleAPIField(input)) return;
     if (input.closest('#paper-form')) { updatePaperPreview(); return; }
+    if (input.closest('#practice-config-dialog') && (input.hasAttribute('data-exclusion') || input.id === 'mistake-paper-count')) { updateSetupPreview(); return; }
     if (input.id === 'bank-search') {
       searchQuery = input.value;
       $('#bank-results').innerHTML = renderBankResults();
@@ -1780,6 +1898,7 @@ ${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新开始'
       return;
     }
     if (input.closest('#paper-form')) { updatePaperPreview(); return; }
+    if (input.closest('#practice-config-dialog') && (input.hasAttribute('data-exclusion') || input.id === 'mistake-paper-count')) { updateSetupPreview(); return; }
     if (input.name === 'collection-sort') { collectionSort = input.value; renderPage(); return; }
     if (input.name === 'unit-timer') {
       const countdown = input.value === 'countdown';
