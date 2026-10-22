@@ -38,7 +38,7 @@
     return weights;
   }
   const answeredItems = session => session.answers.filter(answer => answer && (session.mode === 'memorize' || answer.selection.length));
-  const defaultPreferences = () => ({ count: 100, weights: defaultWeights(), typeWeights: [60, 30, 10], allocationMode: 'combined', studyMode: 'practice', timerMode: 'stopwatch', minutes: 60, includeFlagged: false, exclusions: Core.normalizeExclusions() });
+  const defaultPreferences = () => ({ count: 100, weights: defaultWeights(), typeWeights: [60, 30, 10], allocationMode: 'combined', paperOrder: 'shuffle', studyMode: 'practice', timerMode: 'stopwatch', minutes: 60, includeFlagged: false, exclusions: Core.normalizeExclusions() });
   const defaultState = (libraryId = library?.id ?? 'unloaded') => ({ version: 2, contentRevision: Store.CONTENT_REVISION, libraryId, attempts: [], favorites: [], mastered: [], mistakes: {}, mistakeTarget: 3, goal: 20, theme: { ...PRESETS[0].colors }, session: null, progress: {}, papers: [], preferences: defaultPreferences() });
   let storageFailed = false;
   let preserveUnreadStorage = false;
@@ -229,7 +229,8 @@
       (expectedLibrary.banks.length === 0 || Math.abs(preferences.weights.reduce((sum, value) => sum + value, 0) - 100) < .000001)) {
       clean.preferences = { ...defaultPreferences(), count: preferences.count, weights: expectedLibrary.banks.map((_, index) => preferences.weights[index] ?? 0), timerMode: ['countdown', 'none'].includes(preferences.timerMode) ? preferences.timerMode : 'stopwatch',
         studyMode: Object.hasOwn(STUDY_MODES, preferences.studyMode) ? preferences.studyMode : 'practice',
-        allocationMode: ['unit', 'type', 'combined'].includes(preferences.allocationMode) ? preferences.allocationMode : 'unit',
+        allocationMode: ['unit', 'type', 'combined', 'all'].includes(preferences.allocationMode) ? preferences.allocationMode : 'unit',
+        paperOrder: preferences.paperOrder === 'type' ? 'type' : 'shuffle',
         typeWeights: Array.isArray(preferences.typeWeights) && preferences.typeWeights.length === 3 && preferences.typeWeights.every(n => Number.isFinite(n) && n >= 0 && n <= 100) && Math.abs(preferences.typeWeights.reduce((a, b) => a + b, 0) - 100) < .000001 ? [...preferences.typeWeights] : [60, 30, 10],
         minutes: Number.isInteger(preferences.minutes) ? clamp(preferences.minutes, 1, 1440) : 60, includeFlagged: preferences.includeFlagged === true };
     }
@@ -272,6 +273,10 @@
         contentRevision: session.status === 'completed' ? session.contentRevision === Store.CONTENT_REVISION ? Store.CONTENT_REVISION : 'legacy' : Store.CONTENT_REVISION,
         revisionUpdated: session.revisionUpdated === true || migrated && session.ids.some(id => Store.isRevisedGrading(map.get(id))),
         exclusions: Core.normalizeExclusions(session.exclusions),
+        ...(key === 'paper' ? {
+          allocationMode: ['unit', 'type', 'combined', 'all'].includes(session.allocationMode) ? session.allocationMode : 'unit',
+          paperOrder: session.paperOrder === 'type' ? 'type' : 'shuffle'
+        } : {}),
         key, mode: Object.hasOwn(STUDY_MODES, session.mode) ? session.mode : 'practice',
         status: session.status === 'completed' ? 'completed' : 'active', reason: ['complete', 'timeout', 'finish'].includes(session.reason) ? session.reason : 'complete',
         title: typeof session.title === 'string' ? session.title.slice(0, 120) : '继续练习', ids: [...session.ids], index: session.index,
@@ -531,12 +536,15 @@
   function renderPaperPage() {
     if (!library) return renderLibraryNotice();
     const draft = paperDraft;
-    return `<div class="page-enter"><section class="page-heading"><div><h1>随机组题</h1><p class="heading-description">按单元、题型或两者共同分配。题目随机，选项顺序不变。</p></div></section>
-      <form id="paper-form">${choiceFields('allocation-mode', '抽取方式', [['unit', '按单元'], ['type', '按题型'], ['combined', '单元＋题型']], draft.allocationMode)}
+    return `<div class="page-enter"><section class="page-heading"><div><h1>随机组题</h1><p class="heading-description">按比例抽题或全选当前题库；支持全部乱序、按题型乱序，选项顺序不变。</p></div></section>
+      <form id="paper-form">${choiceFields('allocation-mode', '抽取方式', [['unit', '按单元'], ['type', '按题型'], ['combined', '单元＋题型'], ['all', `全选（当前 ${QUESTIONS.length} 题）`]], draft.allocationMode)}
+      ${choiceFields('paper-order', '试卷排序', [['shuffle', '全部乱序'], ['type', '按题型乱序']], draft.paperOrder)}
+      <p class="setting-note">全部乱序：所有入卷题目混合随机排列。按题型乱序：按单选 → 多选 → 判断排列，每种题型内部随机，跨单元混排。两种排序均不打乱选项。</p>
+      <p class="setting-note" id="paper-all-note" hidden>全选当前版本筛选后的全部可用题目，不受单元比例、题型比例或抽题数量限制。完整默认题库不勾选排除条件时为 1047 题；删改、自定义题目及排除条件会影响实际题量。</p>
       ${entryControls('paper', '继续进度', '重新抽取')}
       <div class="paper-ratios"><section class="panel" id="unit-weight-panel"><div class="card-heading"><h2>单元抽取比例</h2><button type="button" class="text-button" data-action="reset-weights">恢复默认</button></div><p class="setting-note">合计 100%。新增单元默认 0%，可自行调整。</p><div class="allocation-list">${BANKS.map((bank, index) => `<div class="allocation-row"><label for="weight-${index}">${escapeHTML(bank.title)}<small data-capacity="${index}"></small></label><div class="percent-input"><input id="weight-${index}" data-weight="${index}" type="number" min="0" max="100" step="0.1" value="${draft.weights[index] ?? 0}" required aria-label="${escapeHTML(bank.title)}抽题百分比"><span>%</span></div><output data-quota="${index}">— 题</output></div>`).join('')}</div><div class="allocation-total"><span>比例合计</span><strong id="weight-total">100%</strong></div></section>
       <section class="panel" id="type-weight-panel"><div class="card-heading"><h2>题型抽取比例</h2><button type="button" class="text-button" data-action="reset-type-weights">恢复默认</button></div><p class="setting-note">单选 60%、多选 30%、判断 10%，合计须为 100%。</p>${['单选', '多选', '判断'].map((label, index) => `<label class="form-field">${label}（%）<input data-type-weight="${index}" type="number" min="0" max="100" step="0.1" required value="${draft.typeWeights[index]}"></label>`).join('')}<p class="setting-note">叠加模式同时满足两组比例。库存不足时提示，不自动转移配额。</p></section></div>
-      <section class="panel" id="paper-practice-settings" tabindex="-1"><h2>练习设置</h2><label class="form-field">抽题总数<input type="number" id="paper-count" min="1" max="10000" step="1" value="${draft.count}" required></label>${timerFields(draft.timerMode, draft.minutes, 'paper', draft.studyMode, draft.exclusions)}<div class="paper-preview" id="paper-preview" role="status"></div><button class="button primary full-width" id="paper-start" type="submit">生成并开始练习${icon('arrow')}</button><p class="setting-note" id="paper-restart-note">${state.progress.paper && !paperRestartReady ? '已有进度。请点击继续进度，或先点击重新抽取确认后生成新卷。' : '设置只在生成成功后用于新练习；取消设置不会重置原进度。'}</p></section></form></div>`;
+      <section class="panel" id="paper-practice-settings" tabindex="-1"><h2>练习设置</h2><label class="form-field"><span id="paper-count-label">抽题总数</span><input type="number" id="paper-count" min="1" max="10000" step="1" value="${draft.count}" required></label>${timerFields(draft.timerMode, draft.minutes, 'paper', draft.studyMode, draft.exclusions)}<div class="paper-preview" id="paper-preview" role="status"></div><button class="button primary full-width" id="paper-start" type="submit">生成并开始练习${icon('arrow')}</button><p class="setting-note" id="paper-restart-note">${state.progress.paper && !paperRestartReady ? '已有进度。请点击继续进度，或先点击重新抽取确认后生成新卷。' : '设置只在生成成功后用于新练习；取消设置不会重置原进度。'}</p></section></form></div>`;
   }
 
   function choiceFields(name, legend, choices, selected) {
@@ -589,16 +597,25 @@
 
   function updatePaperPreview() {
     if (!$('#paper-form')) return;
-    paperDraft.count = Number($('#paper-count').value);
+    // 全选显示动态库存，但不覆盖上次手动输入的抽题数量，切回按比例抽取时恢复。
+    if (paperDraft.allocationMode !== 'all') paperDraft.count = Number($('#paper-count').value);
     paperDraft.weights = $$('[data-weight]').map(input => input.value === '' ? NaN : Number(input.value));
     paperDraft.timerMode = choice('paper-timer');
     paperDraft.studyMode = choice('paper-mode');
     paperDraft.allocationMode = choice('allocation-mode');
-    $('#unit-weight-panel').hidden = paperDraft.allocationMode === 'type';
-    $('#type-weight-panel').hidden = paperDraft.allocationMode === 'unit';
+    paperDraft.paperOrder = choice('paper-order');
+    const all = paperDraft.allocationMode === 'all';
+    $('#unit-weight-panel').hidden = all || paperDraft.allocationMode === 'type';
+    $('#type-weight-panel').hidden = all || paperDraft.allocationMode === 'unit';
+    $('.paper-ratios').hidden = all;
+    $('#paper-all-note').hidden = !all;
+    $('#paper-count-label').textContent = all ? '本次全选题数（按筛选结果自动计算）' : '抽题总数';
+    $('#paper-count').disabled = all;
+    $('#paper-count').required = !all;
+    if (!all) $('#paper-count').value = paperDraft.count;
     paperDraft.typeWeights = $$('[data-type-weight]').map(input => input.value === '' ? NaN : Number(input.value));
-    $$('[data-weight]').forEach(input => { input.disabled = paperDraft.allocationMode === 'type'; });
-    $$('[data-type-weight]').forEach(input => { input.disabled = paperDraft.allocationMode === 'unit'; });
+    $$('[data-weight]').forEach(input => { input.disabled = all || paperDraft.allocationMode === 'type'; });
+    $$('[data-type-weight]').forEach(input => { input.disabled = all || paperDraft.allocationMode === 'unit'; });
     paperDraft.minutes = Number($('#paper-minutes').value);
     paperDraft.includeFlagged = false;
     paperDraft.exclusions = readExclusions($('#paper-form'));
@@ -609,13 +626,15 @@
     const sum = paperDraft.weights.reduce((total, weight) => total + weight, 0);
     $('#weight-total').textContent = Number.isFinite(sum) ? `${Math.round(sum * 1000) / 1000}%` : '—';
     const capacities = BANKS.map(bank => Core.filterQuestions(bank.questions, paperDraft.exclusions, state.mastered).filter(question => paperDraft.includeFlagged || !question.flags.length).length);
+    const availableCount = capacities.reduce((sum, count) => sum + count, 0);
+    if (all) $('#paper-count').value = availableCount;
     $$('[data-capacity]').forEach((output, index) => { output.textContent = `可抽 ${capacities[index]} 题`; });
     const preview = $('#paper-preview');
     try {
       const { counts, typeCounts } = Core.previewConfiguredPaper(BANKS, { ...paperDraft, masteredIds: state.mastered });
       if (countdown && (!Number.isInteger(paperDraft.minutes) || paperDraft.minutes < 1 || paperDraft.minutes > 1440)) throw new Error('倒计时须为 1～1440 分钟的整数。');
       $$('[data-quota]').forEach((output, index) => { output.textContent = counts ? `${counts[index]} 题` : '随机'; });
-      preview.textContent = `筛选后可抽 ${capacities.reduce((a, b) => a + b, 0)} 题，将抽取 ${paperDraft.count} 题。${typeCounts ? `单选 ${typeCounts[0]} / 多选 ${typeCounts[1]} / 判断 ${typeCounts[2]}。` : '题型不限制。'}${counts ? `覆盖 ${counts.filter(Boolean).length} 个单元。` : '跨单元随机。'}${countdown ? `限时 ${paperDraft.minutes} 分钟。` : paperDraft.timerMode === 'none' ? '不计时。' : '记录用时。'}`;
+      preview.textContent = `筛选后可抽 ${availableCount} 题，${all ? `全部 ${availableCount} 题入卷` : `将抽取 ${paperDraft.count} 题`}。${typeCounts ? `单选 ${typeCounts[0]} / 多选 ${typeCounts[1]} / 判断 ${typeCounts[2]}。` : '题型比例不限制。'}${counts ? `覆盖 ${counts.filter(Boolean).length} 个单元。` : '跨单元随机。'}${paperDraft.paperOrder === 'type' ? '排序：单选 → 多选 → 判断，各题型内乱序。' : '排序：全部乱序。'}${countdown ? `限时 ${paperDraft.minutes} 分钟。` : paperDraft.timerMode === 'none' ? '不计时。' : '记录用时。'}`;
       preview.classList.remove('invalid');
       $('#paper-start').disabled = Boolean(state.progress.paper && !paperRestartReady);
     } catch (error) {
@@ -1192,6 +1211,7 @@ ${tabs}${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新
     state.preferences.exclusions = { ...exclusions };
     paperDraft.exclusions = { ...exclusions };
     state.session = { key, exclusions, contentRevision: Store.CONTENT_REVISION, mode: Object.hasOwn(STUDY_MODES, options.studyMode) ? options.studyMode : 'practice', status: 'active', ids: [...ids], title, index: 0, answers: [], draft: [], elapsed: 0,
+      ...(key === 'paper' ? { allocationMode: options.allocationMode, paperOrder: options.paperOrder } : {}),
       timer: { mode, limitMs: mode === 'countdown' ? minutes * 60000 : 0, elapsedMs: 0, runningSince: null } };
     completedSession = null;
     currentSelection = [];
@@ -1832,9 +1852,15 @@ ${tabs}${entryControls(type, mistakes ? '继续复习' : '继续练习', '重新
         updatePaperPreview();
         if ($('#paper-start').disabled || !event.target.reportValidity()) return;
         const paper = Core.makeConfiguredPaper(BANKS, { ...paperDraft, masteredIds: state.mastered });
-        if (startSession(paper.ids, `随机组题 · ${paper.ids.length} 题`, { ...paperDraft, key: 'paper', restart: paperRestartReady, confirmed: paperRestartReady })) {
+        const title = `${paperDraft.allocationMode === 'all' ? '全题组卷' : '随机组题'} · ${paper.ids.length} 题 · ${paperDraft.paperOrder === 'type' ? '按题型乱序' : '全部乱序'}`;
+        if (startSession(paper.ids, title, { ...paperDraft, key: 'paper', restart: paperRestartReady, confirmed: paperRestartReady })) {
           paperRestartReady = false;
-          state.preferences = { ...paperDraft, weights: [...paperDraft.weights], typeWeights: [...paperDraft.typeWeights] };
+          // 非生效配额允许临时留空；保存时使用有效默认值，避免全选后的刷新丢失模式设置。
+          const validWeights = (values, length) => values.length === length && values.every(value => Number.isFinite(value) && value >= 0 && value <= 100) && Math.abs(values.reduce((a, b) => a + b, 0) - 100) < .000001;
+          state.preferences = { ...paperDraft,
+            count: Number.isInteger(paperDraft.count) && paperDraft.count > 0 && paperDraft.count <= 10000 ? paperDraft.count : 100,
+            weights: validWeights(paperDraft.weights, BANKS.length) ? [...paperDraft.weights] : defaultWeights(),
+            typeWeights: validWeights(paperDraft.typeWeights, 3) ? [...paperDraft.typeWeights] : [60, 30, 10] };
           saveState();
         }
       } else {

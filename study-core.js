@@ -275,15 +275,17 @@
     if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('组卷配置须为对象。');
     if (!Array.isArray(banks) || banks.length < 1 || banks.length > 100) throw new Error('组卷题库须包含 1～100 个单元。');
     const unitCount = banks.length;
-    const { count, allocationMode = 'unit', weights = Array(unitCount).fill(100 / unitCount),
-      typeWeights = [60, 30, 10], includeFlagged = false } = config;
-    if (!Number.isSafeInteger(count) || count < 1 || count > 10000) throw new Error('抽题数量须为 1～10000 的整数。');
-    if (!['unit', 'type', 'combined'].includes(allocationMode)) throw new Error('组卷模式须为 unit、type 或 combined。');
+    const { allocationMode = 'unit', weights = Array(unitCount).fill(100 / unitCount),
+      typeWeights = [60, 30, 10], includeFlagged = false, paperOrder = 'shuffle' } = config;
+    let count = config.count;
+    if (!['unit', 'type', 'combined', 'all'].includes(allocationMode)) throw new Error('组卷模式须为 unit、type、combined 或 all。');
+    if (allocationMode !== 'all' && (!Number.isSafeInteger(count) || count < 1 || count > 10000)) throw new Error('抽题数量须为 1～10000 的整数。');
+    if (!['shuffle', 'type'].includes(paperOrder)) throw new Error('试卷排序须为 shuffle（全部乱序）或 type（按题型乱序）。');
     if (typeof includeFlagged !== 'boolean') throw new Error('includeFlagged 须为布尔值。');
     const keepQuestion = createQuestionFilter(config.exclusions, config.masteredIds);
-    // 只校验当前模式生效的比例，另一维度既不参与配额也不限制抽题。
-    if (allocationMode !== 'type') validatePaperWeights(weights, unitCount, '各单元');
-    if (allocationMode !== 'unit') validatePaperWeights(typeWeights, 3, '三种题型');
+    // 全选不受题量及比例限制；其余模式只校验生效的配额维度。
+    if (allocationMode === 'unit' || allocationMode === 'combined') validatePaperWeights(weights, unitCount, '各单元');
+    if (allocationMode === 'type' || allocationMode === 'combined') validatePaperWeights(typeWeights, 3, '三种题型');
     const pools = Array.from({ length: unitCount }, () => PAPER_TYPES.map(() => []));
     const seen = new Set();
     for (let unitIndex = 0; unitIndex < unitCount; unitIndex++) {
@@ -304,11 +306,16 @@
         pools[unitIndex][typeIndex].push({ id: question.id, unitIndex, typeIndex });
       }
     }
-    const counts = allocationMode === 'type' ? null : allocate(count, weights,
-      pools.map(row => row.reduce((sum, pool) => sum + pool.length, 0)));
-    const typeCounts = allocationMode === 'unit' ? null : allocateTypes(count, typeWeights,
-      PAPER_TYPES.map((_, index) => pools.reduce((sum, row) => sum + row[index].length, 0)));
-    return { count, allocationMode, pools, counts, typeCounts };
+    const unitCapacities = pools.map(row => row.reduce((sum, pool) => sum + pool.length, 0));
+    const typeCapacities = PAPER_TYPES.map((_, index) => pools.reduce((sum, row) => sum + row[index].length, 0));
+    if (allocationMode === 'all') {
+      count = unitCapacities.reduce((sum, capacity) => sum + capacity, 0);
+      if (!count) throw new Error('筛选后没有可入卷的题目，请取消部分排除条件或增加题目。');
+      if (count > 10000) throw new Error('全选题量超过单份试卷 10000 题上限，请先筛选题目。');
+    }
+    const counts = allocationMode === 'all' ? unitCapacities : allocationMode === 'type' ? null : allocate(count, weights, unitCapacities);
+    const typeCounts = allocationMode === 'all' ? typeCapacities : allocationMode === 'unit' ? null : allocateTypes(count, typeWeights, typeCapacities);
+    return { count, allocationMode, paperOrder, pools, counts, typeCounts };
   }
 
   function allocateCombined(pools, counts, typeCounts, random) {
@@ -361,8 +368,9 @@
     return cells.map((row, unitIndex) => row.map((edge, typeIndex) => pools[unitIndex][typeIndex].length - edge.capacity));
   }
 
-  // config.count 必填；默认 unit / 按单元数均分（十单元各 10%）/ 题型 60:30:10 / 排除疑点。
-  // 预览不抽题：未约束维度返回 null，combined 同时返回两组精确配额。
+  // config.count 在非 all 模式必填；全选 all 忽略 count 和比例，使用筛选后的全部库存。
+  // paperOrder 默认 shuffle；type 按单选、多选、判断分组，各组内部乱序。选项顺序不变。
+  // 预览不抽题：未约束维度返回 null，combined / all 同时返回两组精确题量。
   function previewConfiguredPaper(banks, config) {
     const plan = prepareConfiguredPaper(banks, config);
     if (plan.allocationMode === 'combined') allocateCombined(plan.pools, plan.counts, plan.typeCounts);
@@ -381,7 +389,9 @@
     const draw = (pool, count) => {
       if (count) selected.push(...shuffle(pool, nextRandom).slice(0, count));
     };
-    if (plan.allocationMode === 'unit') {
+    if (plan.allocationMode === 'all') {
+      plan.pools.forEach(row => row.forEach(pool => selected.push(...pool)));
+    } else if (plan.allocationMode === 'unit') {
       plan.pools.forEach((row, index) => draw(row.flat(), plan.counts[index]));
     } else if (plan.allocationMode === 'type') {
       PAPER_TYPES.forEach((_, index) => draw(plan.pools.flatMap(row => row[index]), plan.typeCounts[index]));
@@ -389,7 +399,10 @@
       const cellCounts = allocateCombined(plan.pools, plan.counts, plan.typeCounts, nextRandom);
       plan.pools.forEach((row, unitIndex) => row.forEach((pool, typeIndex) => draw(pool, cellCounts[unitIndex][typeIndex])));
     }
-    const ids = shuffle(selected, nextRandom).map(item => item.id);
+    const ordered = plan.paperOrder === 'type'
+      ? PAPER_TYPES.flatMap((_, typeIndex) => shuffle(selected.filter(item => item.typeIndex === typeIndex), nextRandom))
+      : shuffle(selected, nextRandom);
+    const ids = ordered.map(item => item.id);
     const counts = Array(plan.pools.length).fill(0), typeCounts = Array(PAPER_TYPES.length).fill(0);
     selected.forEach(item => { counts[item.unitIndex]++; typeCounts[item.typeIndex]++; });
     if (ids.length !== plan.count || new Set(ids).size !== plan.count ||
